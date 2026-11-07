@@ -1,0 +1,26 @@
+name: sidebooks
+description: SideBooks manga reader
+publish_to: none
+version: 1.0.0
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  image_picker: ^1.1.2
+  path_provider: ^2.1.4
+  file_picker: ^8.1.2
+  archive: ^3.6.1
+  pdfx: ^2.8.0
+  rar: ^0.3.0
+
+# Androidのビルドエラー対策: lifecycleプラグインを古い版に固定(compileSdk 34で動く版)
+dependency_overrides:
+  flutter_plugin_android_lifecycle: 2.0.24
+
+flutter:
+  uses-material-design: true
+  shaders:
+    - shaders/page_curl.frag
