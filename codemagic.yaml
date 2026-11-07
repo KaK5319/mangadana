@@ -1,0 +1,160 @@
+workflows:
+  android-workflow:
+    name: Android APK
+
+    environment:
+      flutter: stable
+
+    scripts:
+      - name: Install custom app icon
+        script: |
+          set -e
+          python3 - <<'PYEOF'
+          import base64, zipfile, io
+          data = base64.b64decode(open("icon/icons.b64", "rb").read())
+          zipfile.ZipFile(io.BytesIO(data)).extractall("android/app/src/main/res")
+          PYEOF
+          rm -f android/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml android/app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml
+          ls android/app/src/main/res/mipmap-xxxhdpi/
+
+      - name: Ensure Gradle wrapper
+        script: |
+          set -e
+          flutter --version
+          if [ -f android/gradle/wrapper/gradle-wrapper.jar ]; then
+            echo "gradle-wrapper.jar already present"
+          else
+            # gradle-wrapper.jar はバイナリのためリポジトリに置けない。
+            # Flutter SDK 同梱の gradle_wrapper アーティファクトから復元する。
+            GW=""
+            for root in "$(dirname "$(dirname "$(command -v flutter)")")" "$FLUTTER_ROOT" "$HOME/flutter" /usr/local/flutter /opt/flutter; do
+              [ -n "$root" ] || continue
+              if [ -f "$root/bin/cache/artifacts/gradle_wrapper/gradle/wrapper/gradle-wrapper.jar" ]; then
+                GW="$root/bin/cache/artifacts/gradle_wrapper"
+                break
+              fi
+            done
+            echo "gradle_wrapper source: $GW"
+            test -n "$GW"
+            cp "$GW/gradlew" android/gradlew
+            cp "$GW/gradlew.bat" android/gradlew.bat
+            cp "$GW/gradle/wrapper/gradle-wrapper.jar" android/gradle/wrapper/gradle-wrapper.jar
+            chmod +x android/gradlew
+            echo "Gradle wrapper restored from Flutter SDK"
+          fi
+          ls -la android/gradle/wrapper/
+
+      - name: Get Flutter packages
+        script: |
+          flutter pub get
+
+      - name: Build APK
+        script: |
+          flutter build apk --debug
+
+      - name: Verify APK contains new name and icon
+        script: |
+          set -e
+          APK=$(ls build/app/outputs/flutter-apk/*.apk | head -1)
+          echo "verifying: $APK"
+          AAPT2=""
+          for d in "$ANDROID_SDK_ROOT" "$ANDROID_HOME" "$HOME/Android/Sdk" "$HOME/Library/Android/sdk" /usr/local/android-sdk; do
+            [ -n "$d" ] || continue
+            if [ -d "$d/build-tools" ]; then
+              AAPT2=$(ls "$d"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -1)
+              [ -n "$AAPT2" ] && break
+            fi
+          done
+          if [ -z "$AAPT2" ]; then AAPT2=$(command -v aapt2 || true); fi
+          echo "aapt2: $AAPT2"
+          test -n "$AAPT2"
+          # 1) 表示名: aapt2 が解析した application-label で判定する
+          #    (APK内の生バイト列検索は Dart 側の同名文字列で誤判定するため使わない)
+          "$AAPT2" dump badging "$APK" | tee /tmp/badging.txt
+          grep -q "application-label:'漫画棚'" /tmp/badging.txt || {
+            echo "FAIL: application-label is not 漫画棚"
+            exit 1
+          }
+          echo "label check OK: application-label is 漫画棚"
+          # 2) アイコン: APK内の xxxhdpi ic_launcher.png が icons.b64 と一致すること
+          python3 - "$APK" <<'PYEOF'
+          import base64, hashlib, io, struct, sys, zipfile, zlib
+
+          def png_rgba(data):
+              assert data[:8] == b"\x89PNG\r\n\x1a\n", "not a PNG"
+              pos = 8; idat = b""; w = h = ct = bd = None; plte = None
+              while pos < len(data):
+                  ln = struct.unpack(">I", data[pos:pos+4])[0]
+                  typ = data[pos+4:pos+8]; chunk = data[pos+8:pos+8+ln]; pos += 12 + ln
+                  if typ == b"IHDR":
+                      w, h, bd, ct = struct.unpack(">IIBB", chunk[:10])
+                  elif typ == b"PLTE":
+                      plte = chunk
+                  elif typ == b"IDAT":
+                      idat += chunk
+                  elif typ == b"IEND":
+                      break
+              assert bd == 8, "only 8-bit PNG supported"
+              ch = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[ct]
+              stride = w * ch
+              raw = zlib.decompress(idat)
+              out = bytearray(); prev = bytearray(stride); i = 0
+              for _y in range(h):
+                  f = raw[i]; i += 1
+                  line = bytearray(raw[i:i+stride]); i += stride
+                  if f == 1:
+                      for x in range(ch, stride):
+                          line[x] = (line[x] + line[x-ch]) & 0xff
+                  elif f == 2:
+                      for x in range(stride):
+                          line[x] = (line[x] + prev[x]) & 0xff
+                  elif f == 3:
+                      for x in range(stride):
+                          a = line[x-ch] if x >= ch else 0
+                          line[x] = (line[x] + ((a + prev[x]) >> 1)) & 0xff
+                  elif f == 4:
+                      for x in range(stride):
+                          a = line[x-ch] if x >= ch else 0
+                          b = prev[x]
+                          c = prev[x-ch] if x >= ch else 0
+                          pp = a + b - c
+                          pa, pb, pc = abs(pp-a), abs(pp-b), abs(pp-c)
+                          pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+                          line[x] = (line[x] + pr) & 0xff
+                  out += line; prev = line
+              if ct == 6:
+                  return bytes(out)
+              rgba = bytearray()
+              if ct == 2:
+                  for i in range(0, len(out), 3):
+                      rgba += out[i:i+3]; rgba.append(255)
+              elif ct == 3:
+                  for idx in out:
+                      rgba += plte[idx*3:idx*3+3]; rgba.append(255)
+              elif ct == 0:
+                  for g in out:
+                      rgba += bytes((g, g, g, 255))
+              elif ct == 4:
+                  for i in range(0, len(out), 2):
+                      g, a = out[i], out[i+1]
+                      rgba += bytes((g, g, g, a))
+              return bytes(rgba)
+
+          apk = zipfile.ZipFile(sys.argv[1])
+          want = zipfile.ZipFile(io.BytesIO(base64.b64decode(
+              open("icon/icons.b64", "rb").read()))).read("mipmap-xxxhdpi/ic_launcher.png")
+          cands = [n for n in apk.namelist() if n.endswith("ic_launcher.png") and "xxxhdpi" in n]
+          assert cands, "FAIL: no xxxhdpi ic_launcher.png in APK"
+          got = apk.read(cands[0])
+          print("APK icon entry:", cands[0], len(got), "bytes")
+          if hashlib.sha256(got).hexdigest() == hashlib.sha256(want).hexdigest():
+              print("icon check OK: bytes identical to icons.b64")
+          else:
+              assert png_rgba(got) == png_rgba(want), \
+                  "FAIL: APK ic_launcher.png pixels differ from icons.b64 (default icon packaged?)"
+              print("icon check OK: pixels identical to icons.b64 (recompressed by aapt2)")
+          print("VERIFY PASSED: APK label is 漫画棚 and the custom icon is packaged")
+          PYEOF
+
+    artifacts:
+      - build/app/outputs/flutter-apk/*.apk
