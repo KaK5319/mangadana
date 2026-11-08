@@ -1103,7 +1103,7 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
   // めくりやすさの調整 ----------------------------------
   static const double _commitAt = 0.15;   // ここまで動かして離せばめくれる(小さいほど軽い。0.5だと半分まで)
   static const double _flickSpeed = 150;  // 軽く払う速さ(px/秒)。小さいほど軽い払いでめくれる
-  static const double _glideDecay = 1.7;  // つながり: 離した後の滑りの減衰。進む距離 = 初速 ÷ この値(小さいほど遠くまでシューと滑る)
+  static const double _glideDecay = 1.7;  // つながり: 離した後の滑りの減衰。進む距離 = 初速 ÷ この値(小さいほど遠くまでシューと滑る)。画面いっぱいの段階だけ、実効値を割り引く(_stripGlide 参照)
   static const double _glideMinSpeed = 40; // つながり: これより遅く離したら滑らず、その場で止まる(帯座標/秒)
 
   late bool _rtl = widget.book.rtl; // この本で最後に選んだ開き方(初めては左開き)
@@ -1130,8 +1130,9 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
   int _stripAnimGen = 0; // 帯アニメーションの世代(割り込みで古い完了処理を捨てる)
   bool _sPinching = false;
   bool _sDragging = false; // つながり: 指で流している間(この間は読み込み開始と画像の破棄を止め、ドラッグを軽く保つ)
-  bool _sGliding = false; // つながり: 離した後に勢いで滑っている間(この間は画像の破棄を止め、到達予測位置の近傍を先読みする)
-  double? _sGlideTarget; // つながり: 滑りの到達予測位置(帯座標)。滑走中の先読みの目当てに使う
+  bool _sGliding = false; // つながり: 離した後に勢いで滑っている間(この間は画像の破棄も新規の読み込み開始も止める。着地点の先読みは滑り始めの一瞬だけ行う)
+  double? _sGlideTarget; // つながり: 滑りの到達予測位置(帯座標)。滑り始めの先読みの目当てに使う
+  bool _sGlideKick = false; // つながり: 滑り始めの一瞬だけ true。その一回だけ、着地点の近傍の先読み開始を許す(_sync 参照)
   int _sAxis = 0; // つながり: このドラッグの主方向(0:未定 1:横 2:縦)。軸固定を使う時だけ決める
   bool _sAxisLock = false; // つながり: このドラッグで軸固定を使うか(画面いっぱいで縦にパンできる範囲がある時だけ)
   double _sStartPos = 0, _sStartZoom = 1.0, _sStartOffY = 0;
@@ -1315,13 +1316,15 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
     } else {
       want = {for (var i = _index - 1; i <= _index + 1; i++) if (i >= 0 && i <= _last) i};
     }
-    // つながりで指で流している間は、読み込みの開始も画像の破棄もしない。
+    // つながりで帯が動いている間は、読み込みの開始も画像の破棄も基本的にしない。
     // ドラッグ中に新しいページのデコード(元の解像度で展開する重い処理)が走ったり、
     // 範囲外になったページを捨てて読み直したりするのが、スライドの重さの原因になるため。
-    // 離した後に勢いで滑っている間は、画像の破棄だけ止めて、進行方向の先は先回りで読み込む。
-    // 完全に止まった後の描画で、必要なページは改めて読み込まれる
+    // 滑っている間も同様で、滑走中に読み込みが始まって完了するたび、画像作り(toImage)が
+    // 滑りの描画と同じラスター処理を取り合ってフレームを落とす。例外は滑り始めの一瞬だけで、
+    // 到達予測位置の近傍(着地点±2)だけ先回りで読み込み始める(_stripGlide が _sGlideKick を
+    // 立てて呼ぶ)。完全に止まった後の _sync で、先読み(±4)は改めて行われる
     final holdDrops = _turn == 1 && (_sDragging || _sGliding);
-    final holdLoads = _turn == 1 && _sDragging;
+    final holdLoads = _turn == 1 && (_sDragging || (_sGliding && !_sGlideKick));
     if (!holdDrops) {
       _cache.removeWhere((k, v) {
         final drop = !want.contains(k);
@@ -1338,10 +1341,11 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
       });
     }
     // つながりでは、読み込みに優先順位を付ける: 今見えているページ → 滑りの着地点の近傍 → 真ん中のページに近い順。
-    // あわせて、帯がアニメーションで動いている間(滑走・ページ移動)は、同時に走る読み込みを2つまでに絞る。
-    // 画像を作る処理(toImage)は描画と同じラスター処理で走るため、大きい段階(画面いっぱい)ほど
-    // まとめて作ると滑りのフレームと競合して引っかかりになる。着地点の近傍を先に用意すれば、
-    // 止まった所で読み込み待ち(ぐるぐる)にもならない。止まっている間は今まで通り一気に読み込む
+    // あわせて、帯がアニメーションで動いている間(ページ移動・滑り始めの先回り読み込み)は、
+    // 同時に走る読み込みを2つまでに絞る。画像を作る処理(toImage)は描画と同じラスター処理で
+    // 走るため、大きい段階(画面いっぱい)ほど、動いている最中に完了が重なると引っかかりになる。
+    // 滑走中の新規開始は滑り始めの一瞬だけにし、完了した画像は描画モデル経由で差し込む
+    // (下の読み込み完了処理)。止まっている間は今まで通り一気に読み込む
     var stripBudget = (_turn == 1 && _stripAnim) ? 2 - _sLoading.length : 1 << 30;
     final List<int> loadOrder;
     if (_turn == 1) {
@@ -1388,7 +1392,17 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
             img.dispose();
             return;
           }
-          setState(() => _sCache[i] = img);
+          if (_turn == 1 && _stripMoving && _stripModel.slots.isNotEmpty) {
+            // 帯が動いている間に全体の build(setState)で差し込むと、その build と
+            // 画像作りの競合で滑りが引っかかる。描画モデル経由で帯の一覧だけ差し替え、
+            // 帯の再描画だけで済ませる(画面に出ているのが帯の描画のときだけ。
+            // 読み込み中スピナーの間は、今まで通り build で切り替える)
+            _sCache[i] = img;
+            _stripModel.slots = _stripSlots(size);
+            _stripModel.poke();
+          } else {
+            setState(() => _sCache[i] = img);
+          }
         });
       } else {
         if (_cache.containsKey(i) || _loading.contains(i)) continue;
@@ -1632,10 +1646,13 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
     }
   }
 
+  /// つながり: 帯が動いているか(指で流している・勢いで滑っている・ページ移動アニメーション中)
+  bool get _stripMoving => _sDragging || _sGliding || _stripAnim;
+
   /// 帯の描画状態(位置・拡大率・縦のずらし・動いているか)を描画モデルへ送る。
   /// ドラッグや滑りの毎フレームは、画面全体の build ではなくこちらだけを更新する
   void _pushStripView() {
-    _stripModel.update(_sPos, _sZoom, _sOffY, _sDragging || _sGliding || _stripAnim);
+    _stripModel.update(_sPos, _sZoom, _sOffY, _stripMoving);
   }
 
   /// 先読みと破棄を今の位置に合わせ直す。毎フレームではなく、
@@ -1711,11 +1728,24 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
 
   /// つながり: 指を離した後、定位置へは寄せず、勢いで滑って自然に止まる(引っ張り無し)。
   /// 初速 v0(帯座標/秒、読み進む向きが正)から指数関数的に減速し、進む距離は v0 ÷ _glideDecay。
+  /// 画面いっぱいの段階だけ、ページ幅が画面幅より広い分(約1.56倍。幅いっぱいは1.2倍)を
+  /// 割り引いて減衰を実効的に下げ、同じ払い方で幅いっぱいと同じくらいのページ数が
+  /// 進むようにする(そのままでは進むページ数が約0.77倍しかなく、強く・長く払う
+  /// 必要があって「力がいる」感じになる)。滑走距離は2ページ分までに抑える。
   /// 帯の端に達したら、はみ出さずにそこで止まる(戻る動きは入れない)。
   /// 滑っている間、ページ数と「つづき」は _syncStripIndex で真ん中のページに同期する
   void _stripGlide(double v0) {
     final from = _sPos;
-    final to = _clampSPos(from + v0 / _glideDecay, _sZoom);
+    var travel = v0 / _glideDecay;
+    if (_fit == 0 && _viewSize.width > 0) {
+      final ratio = _pageW(_index) / _viewSize.width; // ページ幅 ÷ 画面幅
+      if (ratio > 0) {
+        travel = v0 / (_glideDecay * (1.2 / ratio)); // 実効の減衰 = 1.7 × (1.2 ÷ ratio)
+        final maxTravel = 2 * _pageW(_index); // 滑走距離の上限は2ページ分程度
+        if (travel.abs() > maxTravel) travel = travel.sign * maxTravel;
+      }
+    }
+    final to = _clampSPos(from + travel, _sZoom);
     final dist = (to - from).abs();
     if (dist < 1) {
       _syncStripIndex();
@@ -1726,8 +1756,11 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
     final gen = ++_stripAnimGen;
     _stripAnim = true;
     _sGliding = true;
-    _sGlideTarget = to; // 到達予測位置。滑走中の先読み(_sync)がこの近傍を先回りで読み込む
+    _sGlideTarget = to; // 到達予測位置。滑り始めの先読み(_sync)がこの近傍を先回りで読み込む
     _pushStripView();
+    _sGlideKick = true;
+    _syncNow(); // 滑り始めの一瞬だけ、到達予測位置の近傍(±2)の読み込みを先回りで始める
+    _sGlideKick = false;
     _ac.stop();
     void tick() {
       if (gen == _stripAnimGen && mounted) {
@@ -2178,6 +2211,7 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
           _stripModel.rtl = _rtl;
           _stripModel.index = _index;
           _stripModel.hi = _hi;
+          _stripModel.slots = slots;
           _stripModel.pos = _sPos;
           _stripModel.zoom = _sZoom;
           _stripModel.offY = _sOffY;
@@ -2358,6 +2392,7 @@ class _StripModel extends ChangeNotifier {
   bool rtl = false; // 右開きかどうか
   int index = 0; // 今のページ(拡大時に高解像度で描くページ)
   ui.Image? hi; // 拡大用の高解像度画像
+  List<_StripSlot> slots = const []; // 帯に並べるページの一覧。build のたびに代入し直すほか、帯が動いている間の読み込み完了でもここ経由で差し替える(全体の build を起こさないため)
 
   /// 描画状態をまとめて差し替え、変わっていたら描き直しを促す
   void update(double pos, double zoom, double offY, bool moving) {
@@ -2376,7 +2411,9 @@ class _StripModel extends ChangeNotifier {
 }
 
 /// つながりモード用。ページを横一列につなげて描く(カールの曲がりは無い)。
-/// 帯の位置は描画モデルから読み、モデルの通知(repaint)だけで描き直す
+/// 帯の位置と並べるページは描画モデルから読み、モデルの通知(repaint)だけで描き直す。
+/// コンストラクタの一覧は build 時点の控えで、shouldRepaint の比較にだけ使う
+/// (実際に描くのは、読み込み完了で差し替わることもあるモデルの一覧)
 class _StripPainter extends CustomPainter {
   _StripPainter(this.model, this.slots) : super(repaint: model);
   final _StripModel model;
@@ -2386,7 +2423,7 @@ class _StripPainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     final p = Paint();
     final view = Rect.fromLTWH(0, 0, size.width, size.height);
-    for (final s in slots) {
+    for (final s in model.slots) {
       final exLeft = model.zoom * (s.cum - model.pos); // 帯の左端(左開きの向きで見た位置)
       final dstW = model.zoom * s.w;
       final dstLeft = model.rtl ? (size.width - exLeft - dstW) : exLeft; // 右開きは次のページが左に来る
