@@ -1103,7 +1103,7 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
   // めくりやすさの調整 ----------------------------------
   static const double _commitAt = 0.15;   // ここまで動かして離せばめくれる(小さいほど軽い。0.5だと半分まで)
   static const double _flickSpeed = 150;  // 軽く払う速さ(px/秒)。小さいほど軽い払いでめくれる
-  static const double _glideDecay = 2.5;  // つながり: 離した後の滑りの減衰。進む距離 = 初速 ÷ この値(大きいほど早く止まる)
+  static const double _glideDecay = 1.7;  // つながり: 離した後の滑りの減衰。進む距離 = 初速 ÷ この値(小さいほど遠くまでシューと滑る)
   static const double _glideMinSpeed = 40; // つながり: これより遅く離したら滑らず、その場で止まる(帯座標/秒)
 
   late bool _rtl = widget.book.rtl; // この本で最後に選んだ開き方(初めては左開き)
@@ -1130,7 +1130,8 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
   int _stripAnimGen = 0; // 帯アニメーションの世代(割り込みで古い完了処理を捨てる)
   bool _sPinching = false;
   bool _sDragging = false; // つながり: 指で流している間(この間は読み込み開始と画像の破棄を止め、ドラッグを軽く保つ)
-  bool _sGliding = false; // つながり: 離した後に勢いで滑っている間(この間も読み込み開始と画像の破棄を止める)
+  bool _sGliding = false; // つながり: 離した後に勢いで滑っている間(この間は画像の破棄を止め、到達予測位置の近傍を先読みする)
+  double? _sGlideTarget; // つながり: 滑りの到達予測位置(帯座標)。滑走中の先読みの目当てに使う
   double _sStartPos = 0, _sStartZoom = 1.0, _sStartOffY = 0;
   Offset _sStartFocal = Offset.zero;
   double _sGrabBx = 0; // 指の下にある帯座標
@@ -1281,23 +1282,33 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
     }
     final Set<int> want;
     if (_turn == 1) {
-      // つながり: 帯の中央にあるページの前後2ページと、今のページの前後を先読みする
+      // つながり: 帯の中央にあるページの前後4ページと、今のページの前後を先読みする
       final anchor = _stripSnap ? _index : _pageAt(_sPos + _viewSize.width / (2 * _sZoom));
       want = {
-        for (var i = anchor - 2; i <= anchor + 2; i++)
+        for (var i = anchor - 4; i <= anchor + 4; i++)
           if (i >= 0 && i <= _last) i,
         for (var i = _index - 1; i <= _index + 1; i++)
           if (i >= 0 && i <= _last) i,
       };
+      // 勢いで滑っている間は、到達予測位置の近傍も先読みに入れて、着地点で読み込み待ちにならないようにする
+      final gt = _sGlideTarget;
+      if (_sGliding && gt != null) {
+        final land = _pageAt(gt + _viewSize.width / (2 * _sZoom));
+        for (var i = land - 2; i <= land + 2; i++) {
+          if (i >= 0 && i <= _last) want.add(i);
+        }
+      }
     } else {
       want = {for (var i = _index - 1; i <= _index + 1; i++) if (i >= 0 && i <= _last) i};
     }
-    // つながりで指で流している間と、離した後に勢いで滑っている間は、読み込みの開始も画像の破棄もしない。
+    // つながりで指で流している間は、読み込みの開始も画像の破棄もしない。
     // ドラッグ中に新しいページのデコード(元の解像度で展開する重い処理)が走ったり、
     // 範囲外になったページを捨てて読み直したりするのが、スライドの重さの原因になるため。
+    // 離した後に勢いで滑っている間は、画像の破棄だけ止めて、進行方向の先は先回りで読み込む。
     // 完全に止まった後の描画で、必要なページは改めて読み込まれる
-    final holdStrip = _turn == 1 && (_sDragging || _sGliding);
-    if (!holdStrip) {
+    final holdDrops = _turn == 1 && (_sDragging || _sGliding);
+    final holdLoads = _turn == 1 && _sDragging;
+    if (!holdDrops) {
       _cache.removeWhere((k, v) {
         final drop = !want.contains(k);
         if (drop) {
@@ -1316,7 +1327,7 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
       final gen = _fitGen;
       if (_turn == 1) {
         // つながりでは、ページ全体の画像を用意する
-        if (holdStrip) continue; // ドラッグ中は読み込みを始めない
+        if (holdLoads) continue; // ドラッグ中は読み込みを始めない
         if (_sCache.containsKey(i) || _sLoading.contains(i)) continue;
         _sLoading.add(i);
         _loadStrip(i, size, dpr).then((img) {
@@ -1578,6 +1589,7 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
     final gen = ++_stripAnimGen;
     _stripAnim = true;
     _sGliding = false; // ページ移動に切り替わったら、勢いの滑りは終わり
+    _sGlideTarget = null;
     final from = _sPos;
     final to = _clampSPos(_restPos(target, _sZoom), _sZoom);
     _ac.stop();
@@ -1627,6 +1639,7 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
     final gen = ++_stripAnimGen;
     _stripAnim = true;
     _sGliding = true;
+    _sGlideTarget = to; // 到達予測位置。滑走中の先読み(_sync)がこの近傍を先回りで読み込む
     _ac.stop();
     void tick() {
       if (gen == _stripAnimGen && mounted) {
@@ -1638,7 +1651,7 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
     _ac.addListener(tick);
     _ac.value = 0;
     // 初速が「離した瞬間の速さ」と一致するよう、時間 = カーブの初めの傾き(≒3.61)× 距離 ÷ 初速
-    final ms = (3610 * dist / v0.abs()).round().clamp(120, 1800).toInt();
+    final ms = (3610 * dist / v0.abs()).round().clamp(120, 2400).toInt();
     _ac
         .animateTo(1, duration: Duration(milliseconds: ms), curve: const _FrictionCurve())
         .whenComplete(() {
@@ -1646,6 +1659,7 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
       if (!mounted || gen != _stripAnimGen) return;
       _stripAnim = false;
       _sGliding = false;
+      _sGlideTarget = null;
       setState(() => _sPos = to);
       _syncStripIndex();
     });
@@ -1664,6 +1678,7 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
       _stripAnimGen++;
       _stripAnim = false;
       _sGliding = false;
+      _sGlideTarget = null;
       _ac.stop();
     }
     _sPinching = d.pointerCount >= 2;
@@ -2051,7 +2066,7 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
                 onScaleEnd: _onStripScaleEnd,
                 onTapUp: (d) => _onStripTapUp(d, size),
                 child: items.isNotEmpty
-                    ? CustomPaint(painter: _StripPainter(items))
+                    ? CustomPaint(painter: _StripPainter(items, _sDragging || _sGliding || _stripAnim))
                     : const Center(child: CircularProgressIndicator()),
               ),
             ),
@@ -2206,14 +2221,16 @@ class _StripItem {
 
 /// つながりモード用。ページを横一列につなげて描く(カールの曲がりは無い)
 class _StripPainter extends CustomPainter {
-  _StripPainter(this.items);
+  _StripPainter(this.items, this.moving);
   final List<_StripItem> items;
+  final bool moving; // 帯が動いている間(ドラッグ・滑走・ページ移動のアニメーション中)
 
   @override
   void paint(Canvas canvas, Size size) {
     final p = Paint();
     for (final it in items) {
-      p.filterQuality = it.hi ? FilterQuality.high : FilterQuality.medium;
+      // 動いている間は通常ページの画質フィルタを落として滑りを軽くし、止まったら元の画質に戻す
+      p.filterQuality = it.hi ? FilterQuality.high : (moving ? FilterQuality.low : FilterQuality.medium);
       canvas.drawImageRect(it.img, it.src, it.dst, p);
     }
   }
