@@ -1148,9 +1148,9 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
   Future<ui.Image> _load(int i, Size size, double dpr) async {
     final fit = _fit;
     final bytes = await File(widget.book.pages[i]).readAsBytes();
-    // 画面いっぱいのときは、大きく描いても粗くならないよう元の大きさで読み込む
+    // 画面より大きく描く段階(画面いっぱい・幅いっぱい1.2倍)は、粗くならないよう元の大きさで読み込む
     final codec = await ui.instantiateImageCodec(bytes,
-        targetWidth: fit == 0 ? null : (size.width * dpr).round());
+        targetWidth: fit == 2 ? (size.width * dpr).round() : null);
     final src = (await codec.getNextFrame()).image;
     final w = size.width * dpr, h = size.height * dpr;
     final rec = ui.PictureRecorder();
@@ -1162,7 +1162,7 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
     } else if (fit == 2) {
       s = math.min(w * 0.91 / src.width, h * 0.91 / src.height); // まるごと＋余白(周りに約4.5%)
     } else {
-      s = w / src.width; // 幅いっぱい
+      s = w * 1.2 / src.width; // 幅いっぱい(1.2倍。上下の黒帯を減らし、左右は少し切れる)
     }
     final dw = src.width * s, dh = src.height * s;
     c.drawImageRect(
