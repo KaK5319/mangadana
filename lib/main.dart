@@ -1138,6 +1138,12 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
   Offset _sStartFocal = Offset.zero;
   double _sGrabBx = 0; // 指の下にある帯座標
   double _sGrabPy = 0; // 指の下にあるページ座標(縦)
+
+  // つながり: 帯の描画モデル(位置など毎フレーム変わるもの)と、ページ数表示の通知。
+  // ドラッグや滑りの最中は画面全体の build(setState)を走らせず、こちらだけ更新して描き直す
+  final _StripModel _stripModel = _StripModel();
+  final ValueNotifier<int> _pageNotifier = ValueNotifier<int>(0);
+  double _dpr = 1.0; // 直近の描画での dpr(_sync を描画の外から呼ぶときに使う)
   int _mode = 0; // 0:停止 1:次へ -1:前へ
   double _progress = 0;
   double _acc = 0;
@@ -1176,6 +1182,8 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
   void initState() {
     super.initState();
     _index = widget.book.lastPage.clamp(0, widget.book.pages.length - 1);
+    _pageNotifier.value = _index;
+    _stripModel.index = _index;
     ui.FragmentProgram.fromAsset('shaders/page_curl.frag')
         .then((p) => mounted ? setState(() => _shader = p.fragmentShader()) : null);
     Store.loadFit().then((v) {
@@ -1191,6 +1199,8 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
     _uiTimer?.cancel();
     _hi?.dispose();
     _ac.dispose();
+    _stripModel.dispose();
+    _pageNotifier.dispose();
     for (final i in _cache.values) {
       i.dispose();
     }
@@ -1414,6 +1424,7 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
       setState(() {
         if (m == 1 && target == 1) _index++;
         if (m == -1 && target == 0) _index--;
+        _pageNotifier.value = _index; // ページ数表示の通知も合わせておく
         _mode = 0;
         _progress = 0;
         _acc = 0;
@@ -1435,6 +1446,7 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
     final n = i.clamp(0, _last).toInt();
     setState(() {
       _index = n;
+      _pageNotifier.value = n; // ページ数表示の通知も合わせておく
       _mode = 0;
       _progress = 0;
       _acc = 0;
@@ -1525,6 +1537,11 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
   void _dropHi() {
     final old = _hi;
     _hi = null;
+    // 帯の描画モデル側も合わせておく(古いページの高解像度画像を、新しいページの場所に描かないため)
+    if (_stripModel.hi != null) {
+      _stripModel.hi = null;
+      _stripModel.poke();
+    }
     if (old != null) {
       WidgetsBinding.instance.addPostFrameCallback((_) => old.dispose());
     }
@@ -1604,19 +1621,43 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
     return (_viewSize.height - z * h) / 2 - z * top; // はみ出さないときは中央に固定
   }
 
+  /// 「今のページ」を差し替える。ページ数の表示(_pageNotifier 経由)と帯の描画モデルには
+  /// 伝えるが、画面全体の build は起こさない
+  void _setIndex(int c) {
+    _index = c;
+    if (_pageNotifier.value != c) _pageNotifier.value = c;
+    if (_stripModel.index != c) {
+      _stripModel.index = c;
+      _stripModel.poke(); // 拡大表示で高解像度に描くページが変わるので、帯を描き直す
+    }
+  }
+
+  /// 帯の描画状態(位置・拡大率・縦のずらし・動いているか)を描画モデルへ送る。
+  /// ドラッグや滑りの毎フレームは、画面全体の build ではなくこちらだけを更新する
+  void _pushStripView() {
+    _stripModel.update(_sPos, _sZoom, _sOffY, _sDragging || _sGliding || _stripAnim);
+  }
+
+  /// 先読みと破棄を今の位置に合わせ直す。毎フレームではなく、
+  /// 真ん中のページが変わった時と、動きが止まった時にだけ呼ぶ
+  void _syncNow() {
+    if (_viewSize.width > 0) _sync(_viewSize, _dpr);
+  }
+
   /// つながり: 帯の位置は動かさず、画面の真ん中に一番近いページを「今のページ」に合わせる。
   /// ページ数の表示と「つづき」はこちらで同期し、見た目(帯)は指や勢いの動きだけに従う
   void _syncStripIndex() {
     if (_turn != 1 || _viewSize.width == 0) return;
     final c = _pageAt(_sPos + _viewSize.width / (2 * _sZoom));
     if (c == _index) return;
-    setState(() => _index = c);
+    _setIndex(c);
     if (_hi != null) {
       _dropHi(); // 拡大用画像は前のページのものなので捨てて、今のページで取り直す
       if (_sZoom > 1.001) _ensureHi();
     }
     widget.book.lastPage = c;
     widget.onChanged?.call();
+    _syncNow(); // 真ん中のページが変わったので、先読みと破棄の範囲も合わせ直す
   }
 
   /* ---- つながりモード: ページ移動のアニメーション ---- */
@@ -1632,12 +1673,14 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
     _stripAnim = true;
     _sGliding = false; // ページ移動に切り替わったら、勢いの滑りは終わり
     _sGlideTarget = null;
+    _pushStripView();
     final from = _sPos;
     final to = _clampSPos(_restPos(target, _sZoom), _sZoom);
     _ac.stop();
     void tick() {
       if (gen == _stripAnimGen && mounted) {
-        setState(() => _sPos = from + (to - from) * _ac.value);
+        _sPos = from + (to - from) * _ac.value;
+        _pushStripView(); // 毎フレームは帯の描画だけを動かす(全体の build は走らせない)
       }
     }
 
@@ -1650,10 +1693,9 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
       if (!mounted || gen != _stripAnimGen) return;
       _stripAnim = false;
       final changed = target != _index;
-      setState(() {
-        _index = target;
-        _sPos = to;
-      });
+      _sPos = to;
+      _setIndex(target);
+      _pushStripView();
       if (changed) {
         HapticFeedback.selectionClick();
         if (_hi != null) {
@@ -1663,6 +1705,7 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
       }
       widget.book.lastPage = target;
       widget.onChanged?.call();
+      _syncNow(); // 止まったので、先読みと破棄を今の位置に合わせ直す
     });
   }
 
@@ -1676,16 +1719,20 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
     final dist = (to - from).abs();
     if (dist < 1) {
       _syncStripIndex();
+      _pushStripView(); // 滑らずに止まったので、描画の画質フィルタを元に戻す
+      _syncNow(); // 止まったので、先読みと破棄を合わせ直す
       return;
     }
     final gen = ++_stripAnimGen;
     _stripAnim = true;
     _sGliding = true;
     _sGlideTarget = to; // 到達予測位置。滑走中の先読み(_sync)がこの近傍を先回りで読み込む
+    _pushStripView();
     _ac.stop();
     void tick() {
       if (gen == _stripAnimGen && mounted) {
-        setState(() => _sPos = from + (to - from) * _ac.value);
+        _sPos = from + (to - from) * _ac.value;
+        _pushStripView(); // 毎フレームは帯の描画だけを動かす(全体の build は走らせない)
         _syncStripIndex(); // 真ん中のページに、表示と「つづき」だけ合わせる
       }
     }
@@ -1702,8 +1749,10 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
       _stripAnim = false;
       _sGliding = false;
       _sGlideTarget = null;
-      setState(() => _sPos = to);
+      _sPos = to;
+      _pushStripView();
       _syncStripIndex();
+      _syncNow(); // 止まったので、先読みと破棄を今の位置に合わせ直す
     });
   }
 
@@ -1734,6 +1783,7 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
     // 軸固定は、縦にパンできる範囲が本当にある時だけ使う(画面いっぱいで縦にはみ出すページ等)。
     // 縦が固定される段階(幅いっぱい・まるごと＋余白)や拡大中は、今まで通りの自由な動きにする
     _sAxisLock = _fit == 0 && _sZoom <= 1.001 && _pageH(_index) * _sZoom > _viewSize.height + 0.5;
+    _pushStripView(); // 流し始めたことを描画モデルへ(画質フィルタを落とす)
   }
 
   /// 途中から2本指になったとき、その時点をつかみ直す
@@ -1753,11 +1803,10 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
       // ピンチ: 指の下にある帯の点が指に付いてくるように、拡大と位置を決める
       final z = (_sStartZoom * d.scale).clamp(1.0, 3.0).toDouble();
       final inward = _rtl ? (_viewSize.width - d.localFocalPoint.dx) : d.localFocalPoint.dx;
-      setState(() {
-        _sZoom = z;
-        _sPos = _clampSPos(_sGrabBx - inward / z, z);
-        _sOffY = _clampSOffY(d.localFocalPoint.dy - _sGrabPy * z, z);
-      });
+      _sZoom = z;
+      _sPos = _clampSPos(_sGrabBx - inward / z, z);
+      _sOffY = _clampSOffY(d.localFocalPoint.dy - _sGrabPy * z, z);
+      _pushStripView(); // ピンチ中も、帯の描画だけを動かす(全体の build は走らせない)
       if (z > 1.001) _ensureHi();
       return;
     }
@@ -1775,14 +1824,13 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
         _sAxis = 2;
       }
     }
-    setState(() {
-      if (_sAxis != 2) {
-        _sPos = _clampSPos(_sStartPos + (_rtl ? dx : -dx) / _sZoom, _sZoom);
-      }
-      if (_sAxis != 1) {
-        _sOffY = _clampSOffY(_sStartOffY + dy, _sZoom);
-      }
-    });
+    if (_sAxis != 2) {
+      _sPos = _clampSPos(_sStartPos + (_rtl ? dx : -dx) / _sZoom, _sZoom);
+    }
+    if (_sAxis != 1) {
+      _sOffY = _clampSOffY(_sStartOffY + dy, _sZoom);
+    }
+    _pushStripView(); // 指の動きは帯の描画だけに伝える(全体の build は走らせない)
     _syncStripIndex(); // 流している間も、真ん中のページに表示と「つづき」を合わせる
   }
 
@@ -1797,7 +1845,11 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
           _sPos = _clampSPos(_sPos, 1.0);
           _sOffY = _clampSOffY(_sOffY, 1.0);
         });
+        _pushStripView();
         _stripAnimateTo(_pageAt(_sPos + _viewSize.width / 2));
+      } else {
+        _pushStripView(); // 止まったので、描画の画質フィルタを元に戻す
+        _syncNow(); // 止まったので、先読みと破棄を合わせ直す
       }
       return;
     }
@@ -1808,6 +1860,8 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
     final v0 = vRead / _sZoom; // 帯座標での速さ(読み進む向きが正)
     if (v0.abs() < _glideMinSpeed) {
       _syncStripIndex();
+      _pushStripView(); // 止まったので、描画の画質フィルタを元に戻す
+      _syncNow(); // 止まったので、先読みと破棄を合わせ直す
       return;
     }
     _stripGlide(v0);
@@ -1828,6 +1882,7 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
           _sPos = _clampSPos(_sPos, 1.0);
           _sOffY = _clampSOffY(_sOffY, 1.0);
         });
+        _pushStripView();
         _stripAnimateTo(_pageAt(_sPos + _viewSize.width / 2));
       }
       return;
@@ -1843,9 +1898,11 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
   }
 
   /* ---- つながりモード: 描くページの一覧 ---- */
-  List<_StripItem> _stripItems(Size size) {
-    final items = <_StripItem>[];
-    final w = size.width;
+  /// 読み込み済みのページを、帯座標の位置を持った一覧にする。
+  /// 画面への置き方は描画の時に描画モデルの現在位置から計算するので、
+  /// 帯が動くたびにこの一覧を作り直す必要はない(見えているかの判定も描画側で行う)
+  List<_StripSlot> _stripSlots(Size size) {
+    final slots = <_StripSlot>[];
     var cum = 0.0;
     for (var i = 0; i <= _last; i++) {
       final pw = _pageW(i);
@@ -1854,24 +1911,11 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
         final rect = _rects[i];
         final ph = _pageH(i);
         final top = rect?.top ?? (size.height - ph) / 2;
-        final exLeft = _sZoom * (cum - _sPos); // 帯の左端(左開きの向きで見た位置)
-        final dstW = _sZoom * pw;
-        final dstLeft = _rtl ? (w - exLeft - dstW) : exLeft; // 右開きは次のページが左に来る
-        final dst = Rect.fromLTWH(dstLeft, _sZoom * top + _sOffY, dstW, _sZoom * ph);
-        if (dst.right > -50 && dst.left < w + 50) {
-          if (_sZoom > 1.001 && i == _index && _hi != null) {
-            // 拡大中は、今のページだけ高解像度画像で描く
-            items.add(_StripItem(
-                _hi!, Rect.fromLTWH(0, 0, _hi!.width.toDouble(), _hi!.height.toDouble()), dst, true));
-          } else {
-            items.add(
-                _StripItem(img, Rect.fromLTWH(0, 0, img.width.toDouble(), img.height.toDouble()), dst, false));
-          }
-        }
+        slots.add(_StripSlot(i, img, cum, top, pw, ph));
       }
       cum += pw;
     }
-    return items;
+    return slots;
   }
 
   /* ---- ピンチズーム ---- */
@@ -2027,9 +2071,17 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
   }
 
   /* ---- メニュー(下のパネル: ページ数・スライダー・左右ボタン) ---- */
+  /// ページ数の追随だけは、帯の動きに合わせて画面全体の build なしで行う
   Widget _buildBottomPanel() {
+    return ValueListenableBuilder<int>(
+      valueListenable: _pageNotifier,
+      builder: (context, page, _) => _bottomPanel(page),
+    );
+  }
+
+  Widget _bottomPanel(int page) {
     final total = widget.book.pages.length;
-    final shown = _dragPage ?? (_index + 1);
+    final shown = _dragPage ?? (page + 1);
     return Positioned(
       left: 0,
       right: 0,
@@ -2075,6 +2127,7 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
                     _ac.stop();
                     setState(() {
                       _index = 0;
+                      _pageNotifier.value = 0; // ページ数表示の通知も合わせておく
                       _stripSnap = true;
                     });
                     widget.book.lastPage = 0;
@@ -2103,6 +2156,7 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
       body: LayoutBuilder(builder: (context, box) {
         final size = Size(box.maxWidth, box.maxHeight);
         _viewSize = size;
+        _dpr = dpr;
         _sync(size, dpr);
 
         final curIdx = _mode == -1 ? _index - 1 : _index;
@@ -2117,7 +2171,17 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
             _sPos = _clampSPos(_restPos(_index, _sZoom), _sZoom);
             _stripSnap = false;
           }
-          final items = _stripItems(size);
+          final slots = _stripSlots(size);
+          // 描画モデルの固定分(向き・今のページ・高解像度画像・現在の描画状態)を、
+          // 確定した状態に合わせておく。ここでは通知せず代入だけにする
+          // (毎フレーム変わる動きは、ドラッグや滑りの側が _pushStripView で送る)
+          _stripModel.rtl = _rtl;
+          _stripModel.index = _index;
+          _stripModel.hi = _hi;
+          _stripModel.pos = _sPos;
+          _stripModel.zoom = _sZoom;
+          _stripModel.offY = _sOffY;
+          _stripModel.moving = _sDragging || _sGliding || _stripAnim;
           return Stack(fit: StackFit.expand, children: [
             Positioned.fill(
               child: GestureDetector(
@@ -2126,10 +2190,9 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
                 onScaleUpdate: _onStripScaleUpdate,
                 onScaleEnd: _onStripScaleEnd,
                 onTapUp: (d) => _onStripTapUp(d, size),
-                child: items.isNotEmpty
+                child: slots.isNotEmpty
                     // 帯だけを描き直し範囲として隔離する(上下のバー等を同じ絵に巻き込まない)
-                    ? RepaintBoundary(
-                        child: CustomPaint(painter: _StripPainter(items, _sDragging || _sGliding || _stripAnim)))
+                    ? RepaintBoundary(child: CustomPaint(painter: _StripPainter(_stripModel, slots)))
                     : const Center(child: CircularProgressIndicator()),
               ),
             ),
@@ -2273,48 +2336,92 @@ class _FrictionCurve extends Curve {
   }
 }
 
-/// つながりモードで描くページ1つ分(切り取る部分と、画面に置く場所)
-class _StripItem {
-  _StripItem(this.img, this.src, this.dst, this.hi);
+/// つながりモードで描くページ1つ分。位置は帯座標で持ち、画面への置き方は
+/// 描画の時に描画モデルの現在位置から計算する(帯が動いても、この一覧は作り直さなくてよい)
+class _StripSlot {
+  _StripSlot(this.page, this.img, this.cum, this.top, this.w, this.h);
+  final int page;
   final ui.Image img;
-  final Rect src;
-  final Rect dst;
-  final bool hi; // 高解像度画像かどうか
+  final double cum; // 帯座標での左端
+  final double top; // 拡大前の縦位置(画面座標)
+  final double w, h; // ページの大きさ(帯座標)
 }
 
-/// つながりモード用。ページを横一列につなげて描く(カールの曲がりは無い)
+/// つながりモードの帯の描画モデル。位置・拡大率など毎フレーム変わるものはここに入れ、
+/// CustomPainter を repaint で駆動する。ドラッグや滑りの最中は画面全体の build を
+/// 走らせず、このモデルの更新だけで帯が動く
+class _StripModel extends ChangeNotifier {
+  double pos = 0; // 帯のスクロール位置
+  double zoom = 1.0; // 拡大率
+  double offY = 0; // 縦のずらし
+  bool moving = false; // 帯が動いている間(画質フィルタを落とす)
+  bool rtl = false; // 右開きかどうか
+  int index = 0; // 今のページ(拡大時に高解像度で描くページ)
+  ui.Image? hi; // 拡大用の高解像度画像
+
+  /// 描画状態をまとめて差し替え、変わっていたら描き直しを促す
+  void update(double pos, double zoom, double offY, bool moving) {
+    if (this.pos == pos && this.zoom == zoom && this.offY == offY && this.moving == moving) {
+      return;
+    }
+    this.pos = pos;
+    this.zoom = zoom;
+    this.offY = offY;
+    this.moving = moving;
+    notifyListeners();
+  }
+
+  /// 位置などが変わらなくても、描き直しだけを促す(高解像度画像の差し替え等)
+  void poke() => notifyListeners();
+}
+
+/// つながりモード用。ページを横一列につなげて描く(カールの曲がりは無い)。
+/// 帯の位置は描画モデルから読み、モデルの通知(repaint)だけで描き直す
 class _StripPainter extends CustomPainter {
-  _StripPainter(this.items, this.moving);
-  final List<_StripItem> items;
-  final bool moving; // 帯が動いている間(ドラッグ・滑走・ページ移動のアニメーション中)
+  _StripPainter(this.model, this.slots) : super(repaint: model);
+  final _StripModel model;
+  final List<_StripSlot> slots;
 
   @override
   void paint(Canvas canvas, Size size) {
     final p = Paint();
     final view = Rect.fromLTWH(0, 0, size.width, size.height);
-    for (final it in items) {
+    for (final s in slots) {
+      final exLeft = model.zoom * (s.cum - model.pos); // 帯の左端(左開きの向きで見た位置)
+      final dstW = model.zoom * s.w;
+      final dstLeft = model.rtl ? (size.width - exLeft - dstW) : exLeft; // 右開きは次のページが左に来る
+      final dst = Rect.fromLTWH(dstLeft, model.zoom * s.top + model.offY, dstW, model.zoom * s.h);
+      if (dst.right <= -50 || dst.left >= size.width + 50) continue;
+      var img = s.img;
+      var hi = false;
+      // 拡大中は、今のページだけ高解像度画像で描く
+      if (model.zoom > 1.001 && s.page == model.index && model.hi != null) {
+        img = model.hi!;
+        hi = true;
+      }
       // 動いている間は通常ページの画質フィルタを落として滑りを軽くし、止まったら元の画質に戻す
-      p.filterQuality = it.hi ? FilterQuality.high : (moving ? FilterQuality.low : FilterQuality.medium);
+      p.filterQuality = hi ? FilterQuality.high : (model.moving ? FilterQuality.low : FilterQuality.medium);
       // 画面に見えている部分だけを描く。宛先とソースを画面との交わりに切り取る
       // (drawImageRect の対応は線形なので、切り取っても絵は1ピクセルも変わらない)。
       // 画面いっぱいではページが画面より大きく、丸ごと渡すと画面外の分まで描画処理が走る
-      if (it.dst.width <= 0 || it.dst.height <= 0) continue;
-      final vis = it.dst.intersect(view);
+      if (dst.width <= 0 || dst.height <= 0) continue;
+      final vis = dst.intersect(view);
       if (vis.isEmpty) continue;
-      final fx = it.src.width / it.dst.width;
-      final fy = it.src.height / it.dst.height;
+      final src = Rect.fromLTWH(0, 0, img.width.toDouble(), img.height.toDouble());
+      final fx = src.width / dst.width;
+      final fy = src.height / dst.height;
       final srcVis = Rect.fromLTRB(
-        it.src.left + (vis.left - it.dst.left) * fx,
-        it.src.top + (vis.top - it.dst.top) * fy,
-        it.src.left + (vis.right - it.dst.left) * fx,
-        it.src.top + (vis.bottom - it.dst.top) * fy,
+        src.left + (vis.left - dst.left) * fx,
+        src.top + (vis.top - dst.top) * fy,
+        src.left + (vis.right - dst.left) * fx,
+        src.top + (vis.bottom - dst.top) * fy,
       );
-      canvas.drawImageRect(it.img, srcVis, vis, p);
+      canvas.drawImageRect(img, srcVis, vis, p);
     }
   }
 
   @override
-  bool shouldRepaint(covariant _StripPainter old) => true;
+  bool shouldRepaint(covariant _StripPainter old) => old.slots != slots || old.model != model;
 }
 
 
