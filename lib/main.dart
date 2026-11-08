@@ -2127,7 +2127,9 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
                 onScaleEnd: _onStripScaleEnd,
                 onTapUp: (d) => _onStripTapUp(d, size),
                 child: items.isNotEmpty
-                    ? CustomPaint(painter: _StripPainter(items, _sDragging || _sGliding || _stripAnim))
+                    // 帯だけを描き直し範囲として隔離する(上下のバー等を同じ絵に巻き込まない)
+                    ? RepaintBoundary(
+                        child: CustomPaint(painter: _StripPainter(items, _sDragging || _sGliding || _stripAnim)))
                     : const Center(child: CircularProgressIndicator()),
               ),
             ),
@@ -2289,10 +2291,25 @@ class _StripPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     final p = Paint();
+    final view = Rect.fromLTWH(0, 0, size.width, size.height);
     for (final it in items) {
       // 動いている間は通常ページの画質フィルタを落として滑りを軽くし、止まったら元の画質に戻す
       p.filterQuality = it.hi ? FilterQuality.high : (moving ? FilterQuality.low : FilterQuality.medium);
-      canvas.drawImageRect(it.img, it.src, it.dst, p);
+      // 画面に見えている部分だけを描く。宛先とソースを画面との交わりに切り取る
+      // (drawImageRect の対応は線形なので、切り取っても絵は1ピクセルも変わらない)。
+      // 画面いっぱいではページが画面より大きく、丸ごと渡すと画面外の分まで描画処理が走る
+      if (it.dst.width <= 0 || it.dst.height <= 0) continue;
+      final vis = it.dst.intersect(view);
+      if (vis.isEmpty) continue;
+      final fx = it.src.width / it.dst.width;
+      final fy = it.src.height / it.dst.height;
+      final srcVis = Rect.fromLTRB(
+        it.src.left + (vis.left - it.dst.left) * fx,
+        it.src.top + (vis.top - it.dst.top) * fy,
+        it.src.left + (vis.right - it.dst.left) * fx,
+        it.src.top + (vis.bottom - it.dst.top) * fy,
+      );
+      canvas.drawImageRect(it.img, srcVis, vis, p);
     }
   }
 
