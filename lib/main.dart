@@ -1103,6 +1103,8 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
   // めくりやすさの調整 ----------------------------------
   static const double _commitAt = 0.15;   // ここまで動かして離せばめくれる(小さいほど軽い。0.5だと半分まで)
   static const double _flickSpeed = 150;  // 軽く払う速さ(px/秒)。小さいほど軽い払いでめくれる
+  static const double _glideDecay = 2.5;  // つながり: 離した後の滑りの減衰。進む距離 = 初速 ÷ この値(大きいほど早く止まる)
+  static const double _glideMinSpeed = 40; // つながり: これより遅く離したら滑らず、その場で止まる(帯座標/秒)
 
   late bool _rtl = widget.book.rtl; // この本で最後に選んだ開き方(初めては左開き)
   int _index = 0;
@@ -1128,6 +1130,7 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
   int _stripAnimGen = 0; // 帯アニメーションの世代(割り込みで古い完了処理を捨てる)
   bool _sPinching = false;
   bool _sDragging = false; // つながり: 指で流している間(この間は読み込み開始と画像の破棄を止め、ドラッグを軽く保つ)
+  bool _sGliding = false; // つながり: 離した後に勢いで滑っている間(この間も読み込み開始と画像の破棄を止める)
   double _sStartPos = 0, _sStartZoom = 1.0, _sStartOffY = 0;
   Offset _sStartFocal = Offset.zero;
   double _sGrabBx = 0; // 指の下にある帯座標
@@ -1289,11 +1292,11 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
     } else {
       want = {for (var i = _index - 1; i <= _index + 1; i++) if (i >= 0 && i <= _last) i};
     }
-    // つながりで指で流している間は、読み込みの開始も画像の破棄もしない。
+    // つながりで指で流している間と、離した後に勢いで滑っている間は、読み込みの開始も画像の破棄もしない。
     // ドラッグ中に新しいページのデコード(元の解像度で展開する重い処理)が走ったり、
     // 範囲外になったページを捨てて読み直したりするのが、スライドの重さの原因になるため。
-    // 指を離した後の描画で、必要なページは改めて読み込まれる
-    final holdStrip = _turn == 1 && _sDragging;
+    // 完全に止まった後の描画で、必要なページは改めて読み込まれる
+    final holdStrip = _turn == 1 && (_sDragging || _sGliding);
     if (!holdStrip) {
       _cache.removeWhere((k, v) {
         final drop = !want.contains(k);
@@ -1420,6 +1423,7 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
     _fitGen++;
     _stripAnimGen++;
     _stripAnim = false;
+    _sGliding = false;
     setState(() {
       _fit = mode;
       _mode = 0;
@@ -1479,6 +1483,7 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
     _ac.stop();
     _stripAnimGen++;
     _stripAnim = false;
+    _sGliding = false;
     setState(() {
       _turn = mode;
       _mode = 0;
@@ -1546,6 +1551,21 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
     return (_viewSize.height - z * h) / 2 - z * top; // はみ出さないときは中央に固定
   }
 
+  /// つながり: 帯の位置は動かさず、画面の真ん中に一番近いページを「今のページ」に合わせる。
+  /// ページ数の表示と「つづき」はこちらで同期し、見た目(帯)は指や勢いの動きだけに従う
+  void _syncStripIndex() {
+    if (_turn != 1 || _viewSize.width == 0) return;
+    final c = _pageAt(_sPos + _viewSize.width / (2 * _sZoom));
+    if (c == _index) return;
+    setState(() => _index = c);
+    if (_hi != null) {
+      _dropHi(); // 拡大用画像は前のページのものなので捨てて、今のページで取り直す
+      if (_sZoom > 1.001) _ensureHi();
+    }
+    widget.book.lastPage = c;
+    widget.onChanged?.call();
+  }
+
   /* ---- つながりモード: ページ移動のアニメーション ---- */
   void _stripFlip(int dir) {
     if (_stripAnim) return;
@@ -1557,6 +1577,7 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
   void _stripAnimateTo(int target) {
     final gen = ++_stripAnimGen;
     _stripAnim = true;
+    _sGliding = false; // ページ移動に切り替わったら、勢いの滑りは終わり
     final from = _sPos;
     final to = _clampSPos(_restPos(target, _sZoom), _sZoom);
     _ac.stop();
@@ -1591,6 +1612,45 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
     });
   }
 
+  /// つながり: 指を離した後、定位置へは寄せず、勢いで滑って自然に止まる(引っ張り無し)。
+  /// 初速 v0(帯座標/秒、読み進む向きが正)から指数関数的に減速し、進む距離は v0 ÷ _glideDecay。
+  /// 帯の端に達したら、はみ出さずにそこで止まる(戻る動きは入れない)。
+  /// 滑っている間、ページ数と「つづき」は _syncStripIndex で真ん中のページに同期する
+  void _stripGlide(double v0) {
+    final from = _sPos;
+    final to = _clampSPos(from + v0 / _glideDecay, _sZoom);
+    final dist = (to - from).abs();
+    if (dist < 1) {
+      _syncStripIndex();
+      return;
+    }
+    final gen = ++_stripAnimGen;
+    _stripAnim = true;
+    _sGliding = true;
+    _ac.stop();
+    void tick() {
+      if (gen == _stripAnimGen && mounted) {
+        setState(() => _sPos = from + (to - from) * _ac.value);
+        _syncStripIndex(); // 真ん中のページに、表示と「つづき」だけ合わせる
+      }
+    }
+
+    _ac.addListener(tick);
+    _ac.value = 0;
+    // 初速が「離した瞬間の速さ」と一致するよう、時間 = カーブの初めの傾き(≒3.61)× 距離 ÷ 初速
+    final ms = (3610 * dist / v0.abs()).round().clamp(120, 1800).toInt();
+    _ac
+        .animateTo(1, duration: Duration(milliseconds: ms), curve: const _FrictionCurve())
+        .whenComplete(() {
+      _ac.removeListener(tick);
+      if (!mounted || gen != _stripAnimGen) return;
+      _stripAnim = false;
+      _sGliding = false;
+      setState(() => _sPos = to);
+      _syncStripIndex();
+    });
+  }
+
   /* ---- つながりモード: 指の操作 ---- */
   /// 画面の横位置 sx にある帯座標(右開きは左右が入れ替わる)
   double _bxAt(double sx, double z, double pos) =>
@@ -1603,6 +1663,7 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
     if (_stripAnim) {
       _stripAnimGen++;
       _stripAnim = false;
+      _sGliding = false;
       _ac.stop();
     }
     _sPinching = d.pointerCount >= 2;
@@ -1646,10 +1707,11 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
       _sPos = _clampSPos(_sStartPos + (_rtl ? dx : -dx) / _sZoom, _sZoom);
       _sOffY = _clampSOffY(_sStartOffY + dy, _sZoom);
     });
+    _syncStripIndex(); // 流している間も、真ん中のページに表示と「つづき」を合わせる
   }
 
   void _onStripScaleEnd(ScaleEndDetails d) {
-    _sDragging = false; // 離したら読み込みと破棄を再開する
+    _sDragging = false; // ドラッグは終わり。勢いの滑りが始まる場合は、止まるまで読み込みと破棄を止め続ける(_sGliding)
     if (_sPinching) {
       _sPinching = false;
       if (_sZoom < 1.05) {
@@ -1663,17 +1725,16 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
       }
       return;
     }
-    // 離した時、今のページの定位置からページ幅の約1/4を超えて流れていれば隣のページへ、
-    // それ未満なら元のページへ寄せる(以前は「真ん中にあるページ」基準で、ページ幅の半分が
-    // 敷居になっていたため、少し動かすと戻る感触が強かった)。払いが強ければ、その向きへ1ページ進む
+    // 離した時、定位置へは寄せず、勢いで滑って止まる(引っ張り無し)。
+    // ゆっくり離せばほぼその場で止まり、速く払えば遠くまで滑る。
+    // ページ数と「つづき」は、真ん中に一番近いページへ裏で同期する(_syncStripIndex)
     final vRead = _rtl ? d.velocity.pixelsPerSecond.dx : -d.velocity.pixelsPerSecond.dx;
-    final moved = _sPos - _restPos(_index, _sZoom); // 帯座標では、読み進む向きが常に正
-    var target = _index;
-    if (moved > _pageW(_index) / 4) target = _index + 1;
-    if (moved < -_pageW(_index) / 4) target = _index - 1;
-    if (vRead > _flickSpeed) target = math.max(target, _index + 1);
-    if (vRead < -_flickSpeed) target = math.min(target, _index - 1);
-    _stripAnimateTo(target.clamp(0, _last).toInt());
+    final v0 = vRead / _sZoom; // 帯座標での速さ(読み進む向きが正)
+    if (v0.abs() < _glideMinSpeed) {
+      _syncStripIndex();
+      return;
+    }
+    _stripGlide(v0);
   }
 
   void _onStripTapUp(TapUpDetails d, Size size) {
@@ -1934,6 +1995,7 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
                     // つながりでは、開き方を変えたら1ページ目に戻る(帯の並びが入れ替わるため)
                     _stripAnimGen++;
                     _stripAnim = false;
+                    _sGliding = false;
                     _ac.stop();
                     setState(() {
                       _index = 0;
@@ -2116,6 +2178,21 @@ class _ZoomPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _ZoomPainter old) => true;
+}
+
+/// つながりモードの「勢いで滑る」動きのカーブ。速さが指数関数的に落ちていく摩擦の減速で、
+/// 初めの傾き(≒3.61)が、離した瞬間の速さを決める
+class _FrictionCurve extends Curve {
+  const _FrictionCurve();
+
+  static const double _a = 3.5;
+
+  @override
+  double transform(double t) {
+    if (t <= 0) return 0;
+    if (t >= 1) return 1;
+    return (1 - math.exp(-_a * t)) / (1 - math.exp(-_a));
+  }
 }
 
 /// つながりモードで描くページ1つ分(切り取る部分と、画面に置く場所)
