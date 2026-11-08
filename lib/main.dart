@@ -1127,6 +1127,7 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
   bool _stripAnim = false; // 帯をアニメーションで流している間
   int _stripAnimGen = 0; // 帯アニメーションの世代(割り込みで古い完了処理を捨てる)
   bool _sPinching = false;
+  bool _sDragging = false; // つながり: 指で流している間(この間は読み込み開始と画像の破棄を止め、ドラッグを軽く保つ)
   double _sStartPos = 0, _sStartZoom = 1.0, _sStartOffY = 0;
   Offset _sStartFocal = Offset.zero;
   double _sGrabBx = 0; // 指の下にある帯座標
@@ -1288,23 +1289,31 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
     } else {
       want = {for (var i = _index - 1; i <= _index + 1; i++) if (i >= 0 && i <= _last) i};
     }
-    _cache.removeWhere((k, v) {
-      final drop = !want.contains(k);
-      if (drop) {
-        v.dispose();
-        _rects.remove(k);
-      }
-      return drop;
-    });
-    _sCache.removeWhere((k, v) {
-      final drop = !want.contains(k);
-      if (drop) v.dispose();
-      return drop;
-    });
+    // つながりで指で流している間は、読み込みの開始も画像の破棄もしない。
+    // ドラッグ中に新しいページのデコード(元の解像度で展開する重い処理)が走ったり、
+    // 範囲外になったページを捨てて読み直したりするのが、スライドの重さの原因になるため。
+    // 指を離した後の描画で、必要なページは改めて読み込まれる
+    final holdStrip = _turn == 1 && _sDragging;
+    if (!holdStrip) {
+      _cache.removeWhere((k, v) {
+        final drop = !want.contains(k);
+        if (drop) {
+          v.dispose();
+          _rects.remove(k);
+        }
+        return drop;
+      });
+      _sCache.removeWhere((k, v) {
+        final drop = !want.contains(k);
+        if (drop) v.dispose();
+        return drop;
+      });
+    }
     for (final i in want) {
       final gen = _fitGen;
       if (_turn == 1) {
         // つながりでは、ページ全体の画像を用意する
+        if (holdStrip) continue; // ドラッグ中は読み込みを始めない
         if (_sCache.containsKey(i) || _sLoading.contains(i)) continue;
         _sLoading.add(i);
         _loadStrip(i, size, dpr).then((img) {
@@ -1588,6 +1597,7 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
       pos + (_rtl ? (_viewSize.width - sx) : sx) / z;
 
   void _onStripScaleStart(ScaleStartDetails d) {
+    _sDragging = true; // 流している間は読み込みと破棄を止める(_sync 参照)
     _uiTimer?.cancel();
     if (_ui) setState(() => _ui = false); // 流し始めたらメニューを消す
     if (_stripAnim) {
@@ -1639,6 +1649,7 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
   }
 
   void _onStripScaleEnd(ScaleEndDetails d) {
+    _sDragging = false; // 離したら読み込みと破棄を再開する
     if (_sPinching) {
       _sPinching = false;
       if (_sZoom < 1.05) {
@@ -1652,9 +1663,14 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
       }
       return;
     }
-    // 離した時、画面の真ん中に一番近いページが「今のページ」になる。払いが強ければ、その向きへ1ページ進む
+    // 離した時、今のページの定位置からページ幅の約1/4を超えて流れていれば隣のページへ、
+    // それ未満なら元のページへ寄せる(以前は「真ん中にあるページ」基準で、ページ幅の半分が
+    // 敷居になっていたため、少し動かすと戻る感触が強かった)。払いが強ければ、その向きへ1ページ進む
     final vRead = _rtl ? d.velocity.pixelsPerSecond.dx : -d.velocity.pixelsPerSecond.dx;
-    var target = _pageAt(_sPos + _viewSize.width / (2 * _sZoom));
+    final moved = _sPos - _restPos(_index, _sZoom); // 帯座標では、読み進む向きが常に正
+    var target = _index;
+    if (moved > _pageW(_index) / 4) target = _index + 1;
+    if (moved < -_pageW(_index) / 4) target = _index - 1;
     if (vRead > _flickSpeed) target = math.max(target, _index + 1);
     if (vRead < -_flickSpeed) target = math.min(target, _index - 1);
     _stripAnimateTo(target.clamp(0, _last).toInt());
