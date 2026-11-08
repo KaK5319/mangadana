@@ -1132,6 +1132,8 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
   bool _sDragging = false; // つながり: 指で流している間(この間は読み込み開始と画像の破棄を止め、ドラッグを軽く保つ)
   bool _sGliding = false; // つながり: 離した後に勢いで滑っている間(この間は画像の破棄を止め、到達予測位置の近傍を先読みする)
   double? _sGlideTarget; // つながり: 滑りの到達予測位置(帯座標)。滑走中の先読みの目当てに使う
+  int _sAxis = 0; // つながり: このドラッグの主方向(0:未定 1:横 2:縦)。軸固定を使う時だけ決める
+  bool _sAxisLock = false; // つながり: このドラッグで軸固定を使うか(画面いっぱいで縦にパンできる範囲がある時だけ)
   double _sStartPos = 0, _sStartZoom = 1.0, _sStartOffY = 0;
   Offset _sStartFocal = Offset.zero;
   double _sGrabBx = 0; // 指の下にある帯座標
@@ -1281,9 +1283,11 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
       _stripSnap = true; // 画面の大きさが変わったら、つながりの帯も合わせ直す
     }
     final Set<int> want;
+    var stripAnchor = _index; // つながり: 先読みの中心(読み込みの優先順位付けに使う)
     if (_turn == 1) {
       // つながり: 帯の中央にあるページの前後4ページと、今のページの前後を先読みする
       final anchor = _stripSnap ? _index : _pageAt(_sPos + _viewSize.width / (2 * _sZoom));
+      stripAnchor = anchor;
       want = {
         for (var i = anchor - 4; i <= anchor + 4; i++)
           if (i >= 0 && i <= _last) i,
@@ -1323,12 +1327,50 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
         return drop;
       });
     }
-    for (final i in want) {
+    // つながりでは、読み込みに優先順位を付ける: 今見えているページ → 滑りの着地点の近傍 → 真ん中のページに近い順。
+    // あわせて、帯がアニメーションで動いている間(滑走・ページ移動)は、同時に走る読み込みを2つまでに絞る。
+    // 画像を作る処理(toImage)は描画と同じラスター処理で走るため、大きい段階(画面いっぱい)ほど
+    // まとめて作ると滑りのフレームと競合して引っかかりになる。着地点の近傍を先に用意すれば、
+    // 止まった所で読み込み待ち(ぐるぐる)にもならない。止まっている間は今まで通り一気に読み込む
+    var stripBudget = (_turn == 1 && _stripAnim) ? 2 - _sLoading.length : 1 << 30;
+    final List<int> loadOrder;
+    if (_turn == 1) {
+      final seen = <int>{};
+      final ord = <int>[];
+      void addPage(int i) {
+        if (i >= 0 && i <= _last && want.contains(i) && seen.add(i)) ord.add(i);
+      }
+
+      final va = _pageAt(_sPos);
+      final vb = _pageAt(_sPos + _viewSize.width / _sZoom);
+      for (var i = math.min(va, vb); i <= math.max(va, vb); i++) {
+        addPage(i);
+      }
+      final landTarget = _sGlideTarget;
+      if (_sGliding && landTarget != null) {
+        final land = _pageAt(landTarget + _viewSize.width / (2 * _sZoom));
+        for (var d = 0; d <= 2; d++) {
+          addPage(land - d);
+          addPage(land + d);
+        }
+      }
+      final rest = want.toList()
+        ..sort((x, y) => (x - stripAnchor).abs().compareTo((y - stripAnchor).abs()));
+      for (final i in rest) {
+        addPage(i);
+      }
+      loadOrder = ord;
+    } else {
+      loadOrder = want.toList();
+    }
+    for (final i in loadOrder) {
       final gen = _fitGen;
       if (_turn == 1) {
         // つながりでは、ページ全体の画像を用意する
         if (holdLoads) continue; // ドラッグ中は読み込みを始めない
         if (_sCache.containsKey(i) || _sLoading.contains(i)) continue;
+        if (stripBudget <= 0) break; // 動いている間は、読み込みを少しずつに分ける
+        stripBudget--;
         _sLoading.add(i);
         _loadStrip(i, size, dpr).then((img) {
           _sLoading.remove(i);
@@ -1688,6 +1730,10 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
     _sStartFocal = d.localFocalPoint;
     _sGrabBx = _bxAt(d.localFocalPoint.dx, _sZoom, _sPos);
     _sGrabPy = (d.localFocalPoint.dy - _sOffY) / _sZoom;
+    _sAxis = 0;
+    // 軸固定は、縦にパンできる範囲が本当にある時だけ使う(画面いっぱいで縦にはみ出すページ等)。
+    // 縦が固定される段階(幅いっぱい・まるごと＋余白)や拡大中は、今まで通りの自由な動きにする
+    _sAxisLock = _fit == 0 && _sZoom <= 1.001 && _pageH(_index) * _sZoom > _viewSize.height + 0.5;
   }
 
   /// 途中から2本指になったとき、その時点をつかみ直す
@@ -1718,9 +1764,24 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
     // 1本指: 横は帯を流し(右開きは向きが逆)、縦ははみ出しの範囲でずらす
     final dx = d.localFocalPoint.dx - _sStartFocal.dx;
     final dy = d.localFocalPoint.dy - _sStartFocal.dy;
+    // 軸固定(画面いっぱいで縦にも動ける時だけ): 横に流すつもりが少し斜めになると、
+    // 縦も一緒に付いてきて動きがぎこちなくなる。はっきりした主方向が出たら、
+    // もう一方はそのドラッグの間は固定する
+    if (_sAxisLock && _sAxis == 0) {
+      final ax = dx.abs(), ay = dy.abs();
+      if (ax >= 14 && ax >= 2 * ay) {
+        _sAxis = 1;
+      } else if (ay >= 14 && ay >= 2 * ax) {
+        _sAxis = 2;
+      }
+    }
     setState(() {
-      _sPos = _clampSPos(_sStartPos + (_rtl ? dx : -dx) / _sZoom, _sZoom);
-      _sOffY = _clampSOffY(_sStartOffY + dy, _sZoom);
+      if (_sAxis != 2) {
+        _sPos = _clampSPos(_sStartPos + (_rtl ? dx : -dx) / _sZoom, _sZoom);
+      }
+      if (_sAxis != 1) {
+        _sOffY = _clampSOffY(_sStartOffY + dy, _sZoom);
+      }
     });
     _syncStripIndex(); // 流している間も、真ん中のページに表示と「つづき」を合わせる
   }
