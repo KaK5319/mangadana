@@ -248,6 +248,29 @@ class Store {
     } catch (_) {}
   }
 
+  /// リーダーの大きさ段階(0:画面いっぱい 1:幅いっぱい 2:まるごと＋余白)。アプリ全体で1つ覚える
+  static Future<File> _fitFile() async {
+    final d = await getApplicationDocumentsDirectory();
+    return File('${d.path}/reader_fit.txt');
+  }
+
+  static Future<int?> loadFit() async {
+    try {
+      final f = await _fitFile();
+      if (!await f.exists()) return null;
+      final v = int.tryParse((await f.readAsString()).trim());
+      return (v != null && v >= 0 && v <= 2) ? v : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static Future<void> saveFit(int n) async {
+    try {
+      await (await _fitFile()).writeAsString('$n');
+    } catch (_) {}
+  }
+
   static Future<File> _shelvesFile() async {
     final d = await getApplicationDocumentsDirectory();
     return File('${d.path}/shelves.json');
@@ -1060,6 +1083,13 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
 
   late bool _rtl = widget.book.rtl; // この本で最後に選んだ開き方(初めては左開き)
   int _index = 0;
+
+  // 大きさ3段階(0:画面いっぱい 1:幅いっぱい 2:まるごと＋余白)。選んだ段階はアプリ全体で覚える
+  static const List<String> _fitNames = ['画面いっぱい', '幅いっぱい', 'まるごと＋余白'];
+  static const List<IconData> _fitIcons = [Icons.fullscreen, Icons.fit_screen, Icons.close_fullscreen];
+  static const List<int> _fitCycle = [1, 0, 2]; // 幅いっぱい → 画面いっぱい → まるごと＋余白 → 幅いっぱい
+  int _fit = 1; // 最初は幅いっぱい(従来の標準表示)
+  int _fitGen = 0; // 段階を切り替えるたびに増やし、前の段階で読み込んだ画像を捨てる
   int _mode = 0; // 0:停止 1:次へ -1:前へ
   double _progress = 0;
   double _acc = 0;
@@ -1098,6 +1128,9 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
     _index = widget.book.lastPage.clamp(0, widget.book.pages.length - 1);
     ui.FragmentProgram.fromAsset('shaders/page_curl.frag')
         .then((p) => mounted ? setState(() => _shader = p.fragmentShader()) : null);
+    Store.loadFit().then((v) {
+      if (mounted && v != null && v != _fit) _setFit(v, announce: false);
+    });
   }
 
   @override
@@ -1111,16 +1144,26 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
     super.dispose();
   }
 
-  /* ---- 画像の読み込み(画面サイズに合わせて白背景で中央配置) ---- */
+  /* ---- 画像の読み込み(画面サイズの画像に、大きさ段階に合わせて中央配置) ---- */
   Future<ui.Image> _load(int i, Size size, double dpr) async {
+    final fit = _fit;
     final bytes = await File(widget.book.pages[i]).readAsBytes();
-    final codec = await ui.instantiateImageCodec(bytes, targetWidth: (size.width * dpr).round());
+    // 画面いっぱいのときは、大きく描いても粗くならないよう元の大きさで読み込む
+    final codec = await ui.instantiateImageCodec(bytes,
+        targetWidth: fit == 0 ? null : (size.width * dpr).round());
     final src = (await codec.getNextFrame()).image;
     final w = size.width * dpr, h = size.height * dpr;
     final rec = ui.PictureRecorder();
     final c = Canvas(rec);
     c.drawRect(Rect.fromLTWH(0, 0, w, h), Paint()..color = _bg);
-    final s = math.min(w / src.width, h / src.height);
+    final double s;
+    if (fit == 0) {
+      s = math.max(w / src.width, h / src.height); // 画面いっぱい(はみ出した分は切れる)
+    } else if (fit == 2) {
+      s = math.min(w * 0.91 / src.width, h * 0.91 / src.height); // まるごと＋余白(周りに約4.5%)
+    } else {
+      s = w / src.width; // 幅いっぱい
+    }
     final dw = src.width * s, dh = src.height * s;
     c.drawImageRect(
       src,
@@ -1156,9 +1199,10 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
     for (final i in want) {
       if (_cache.containsKey(i) || _loading.contains(i)) continue;
       _loading.add(i);
+      final gen = _fitGen;
       _load(i, size, dpr).then((img) {
         _loading.remove(i);
-        if (!mounted || size != _cacheSize) {
+        if (!mounted || size != _cacheSize || gen != _fitGen) {
           img.dispose();
           return;
         }
@@ -1230,6 +1274,47 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
       });
       _settle(0);
     }
+  }
+
+  /* ---- 大きさ3段階 ---- */
+  /// 段階を切り替える。拡大はリセットし、描き直しのために読み込み済みの画像を捨てる
+  void _setFit(int mode, {bool announce = true}) {
+    final oldHi = _hi;
+    _ac.stop();
+    _fitGen++;
+    setState(() {
+      _fit = mode;
+      _mode = 0;
+      _progress = 0;
+      _acc = 0;
+      _zoom = 1.0;
+      _offset = Offset.zero;
+      _hi = null;
+      for (final img in _cache.values) {
+        img.dispose();
+      }
+      _cache.clear();
+      _rects.clear();
+      _loading.clear();
+      _cacheSize = Size.zero; // 次の描画で、新しい段階の大きさで読み直す
+    });
+    if (oldHi != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => oldHi.dispose());
+    }
+    if (!announce) return;
+    Store.saveFit(mode);
+    final m = ScaffoldMessenger.of(context);
+    m.hideCurrentSnackBar();
+    m.showSnackBar(SnackBar(
+      content: Text(_fitNames[mode], textAlign: TextAlign.center),
+      duration: const Duration(milliseconds: 900),
+      behavior: SnackBarBehavior.floating,
+    ));
+  }
+
+  void _cycleFit() {
+    final i = _fitCycle.indexOf(_fit);
+    _setFit(_fitCycle[(i + 1) % _fitCycle.length]);
   }
 
   /* ---- ピンチズーム ---- */
@@ -1366,7 +1451,12 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
                   overflow: TextOverflow.ellipsis,
                   style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
             ),
-            const SizedBox(width: 64),
+            // 大きさ3段階ボタン(押すたびに 幅いっぱい→画面いっぱい→まるごと＋余白 と形が変わる)
+            IconButton(
+              icon: Icon(_fitIcons[_fit], color: Colors.white),
+              tooltip: _fitNames[_fit],
+              onPressed: _cycleFit,
+            ),
           ]),
         ),
       ),
@@ -1485,7 +1575,8 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
               child: ready
                   ? CustomPaint(
                       painter: (_zoom > 1.001 && _mode == 0)
-                          ? _ZoomPainter(_hi ?? cur, _hi == null, _zoom, _offset)
+                          ? _ZoomPainter(_hi ?? cur, _hi == null, _zoom, _offset,
+                              _rects[curIdx] ?? (Offset.zero & size))
                           : _CurlPainter(_shader!, cur, next, _mode == 0 ? 0 : _progress, _rtl, _tilt,
                               _rects[curIdx] ?? (Offset.zero & size), _rects[nextIdx] ?? (Offset.zero & size)))
                   : const Center(child: CircularProgressIndicator()),
@@ -1536,11 +1627,12 @@ class _CurlPainter extends CustomPainter {
 
 /// 拡大表示用。高解像度画像があればそれを、無ければ画面サイズの画像を拡大して描く
 class _ZoomPainter extends CustomPainter {
-  _ZoomPainter(this.img, this.fitted, this.zoom, this.offset);
+  _ZoomPainter(this.img, this.fitted, this.zoom, this.offset, this.pageRect);
   final ui.Image img;
   final bool fitted; // true: 画面サイズに整形済みの画像
   final double zoom;
   final Offset offset;
+  final Rect pageRect; // 高解像度画像を置く場所(現在の大きさ段階でのページの矩形)
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -1553,9 +1645,7 @@ class _ZoomPainter extends CustomPainter {
       dst = Offset.zero & size;
     } else {
       canvas.drawRect(Offset.zero & size, Paint()..color = _bg);
-      final sc = math.min(size.width / img.width, size.height / img.height);
-      final dw = img.width * sc, dh = img.height * sc;
-      dst = Rect.fromLTWH((size.width - dw) / 2, (size.height - dh) / 2, dw, dh);
+      dst = pageRect;
     }
     canvas.drawImageRect(img, src, dst, Paint()..filterQuality = FilterQuality.high);
     canvas.restore();
