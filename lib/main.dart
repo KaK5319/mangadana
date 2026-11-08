@@ -271,6 +271,29 @@ class Store {
     } catch (_) {}
   }
 
+  /// リーダーのめくり方(0:カール 1:つながり)。大きさ段階と同じ流儀で、アプリ全体で1つ覚える
+  static Future<File> _modeFile() async {
+    final d = await getApplicationDocumentsDirectory();
+    return File('${d.path}/reader_mode.txt');
+  }
+
+  static Future<int?> loadMode() async {
+    try {
+      final f = await _modeFile();
+      if (!await f.exists()) return null;
+      final v = int.tryParse((await f.readAsString()).trim());
+      return (v != null && v >= 0 && v <= 1) ? v : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static Future<void> saveMode(int n) async {
+    try {
+      await (await _modeFile()).writeAsString('$n');
+    } catch (_) {}
+  }
+
   static Future<File> _shelvesFile() async {
     final d = await getApplicationDocumentsDirectory();
     return File('${d.path}/shelves.json');
@@ -1090,6 +1113,24 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
   static const List<int> _fitCycle = [1, 0, 2]; // 幅いっぱい → 画面いっぱい → まるごと＋余白 → 幅いっぱい
   int _fit = 1; // 最初は幅いっぱい(従来の標準表示)
   int _fitGen = 0; // 段階を切り替えるたびに増やし、前の段階で読み込んだ画像を捨てる
+
+  // めくり方(0:カールめくり 1:つながりスライド)。選んだ方法はアプリ全体で覚える
+  static const List<String> _turnNames = ['カールめくり', 'つながり'];
+  static const List<IconData> _turnIcons = [Icons.auto_stories, Icons.view_carousel];
+  int _turn = 0;
+
+  // つながりモードの状態 --------------------------------
+  double _sPos = 0; // 帯のスクロール位置(帯座標で、画面の端に来る位置)
+  double _sZoom = 1.0; // つながりモードの拡大率(1〜3)
+  double _sOffY = 0; // つながりモードの縦のずらし(はみ出す段階でのみ動く)
+  bool _stripSnap = true; // 次の描画で、今のページの位置へ帯を合わせる
+  bool _stripAnim = false; // 帯をアニメーションで流している間
+  int _stripAnimGen = 0; // 帯アニメーションの世代(割り込みで古い完了処理を捨てる)
+  bool _sPinching = false;
+  double _sStartPos = 0, _sStartZoom = 1.0, _sStartOffY = 0;
+  Offset _sStartFocal = Offset.zero;
+  double _sGrabBx = 0; // 指の下にある帯座標
+  double _sGrabPy = 0; // 指の下にあるページ座標(縦)
   int _mode = 0; // 0:停止 1:次へ -1:前へ
   double _progress = 0;
   double _acc = 0;
@@ -1117,6 +1158,8 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
   final Map<int, ui.Image> _cache = {};
   final Map<int, Rect> _rects = {}; // 各ページの大きさ(画面上の位置)。この中だけがめくれる
   final Set<int> _loading = {};
+  final Map<int, ui.Image> _sCache = {}; // つながり用: ページ全体(端まで全部)の画像
+  final Set<int> _sLoading = {};
   Size _cacheSize = Size.zero;
 
   int get _last => widget.book.pages.length - 1;
@@ -1131,6 +1174,9 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
     Store.loadFit().then((v) {
       if (mounted && v != null && v != _fit) _setFit(v, announce: false);
     });
+    Store.loadMode().then((v) {
+      if (mounted && v != null && v != _turn) _setTurn(v, announce: false);
+    });
   }
 
   @override
@@ -1139,6 +1185,9 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
     _hi?.dispose();
     _ac.dispose();
     for (final i in _cache.values) {
+      i.dispose();
+    }
+    for (final i in _sCache.values) {
       i.dispose();
     }
     super.dispose();
@@ -1177,6 +1226,39 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
     return out;
   }
 
+  /// つながり用: ページ全体を、大きさ段階の拡大率そのままで1枚の画像にする。
+  /// カール用(_load)は画面サイズに切り取ってしまうため、端の文字まで見せるにはこちらが要る。
+  /// 解像度の条件と拡大率の計算は _load と同じで、帯の寸法に使う矩形も同じものを覚える
+  Future<ui.Image> _loadStrip(int i, Size size, double dpr) async {
+    final fit = _fit;
+    final bytes = await File(widget.book.pages[i]).readAsBytes();
+    final codec = await ui.instantiateImageCodec(bytes,
+        targetWidth: fit == 2 ? (size.width * dpr).round() : null);
+    final src = (await codec.getNextFrame()).image;
+    final w = size.width * dpr, h = size.height * dpr;
+    final double s;
+    if (fit == 0) {
+      s = math.max(w / src.width, h / src.height); // 画面いっぱい
+    } else if (fit == 2) {
+      s = math.min(w * 0.91 / src.width, h * 0.91 / src.height); // まるごと＋余白
+    } else {
+      s = w * 1.2 / src.width; // 幅いっぱい(1.2倍)
+    }
+    final dw = src.width * s, dh = src.height * s;
+    final rec = ui.PictureRecorder();
+    final c = Canvas(rec);
+    c.drawImageRect(
+      src,
+      Rect.fromLTWH(0, 0, src.width.toDouble(), src.height.toDouble()),
+      Rect.fromLTWH(0, 0, dw, dh),
+      Paint()..filterQuality = FilterQuality.medium,
+    );
+    final out = await rec.endRecording().toImage(dw.round(), dh.round());
+    src.dispose();
+    _rects[i] = Rect.fromLTWH((w - dw) / 2 / dpr, (h - dh) / 2 / dpr, dw / dpr, dh / dpr);
+    return out;
+  }
+
   void _sync(Size size, double dpr) {
     if (size != _cacheSize) {
       for (final i in _cache.values) {
@@ -1185,9 +1267,27 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
       _cache.clear();
       _rects.clear();
       _loading.clear();
+      for (final i in _sCache.values) {
+        i.dispose();
+      }
+      _sCache.clear();
+      _sLoading.clear();
       _cacheSize = size;
+      _stripSnap = true; // 画面の大きさが変わったら、つながりの帯も合わせ直す
     }
-    final want = {for (var i = _index - 1; i <= _index + 1; i++) if (i >= 0 && i <= _last) i};
+    final Set<int> want;
+    if (_turn == 1) {
+      // つながり: 帯の中央にあるページの前後2ページと、今のページの前後を先読みする
+      final anchor = _stripSnap ? _index : _pageAt(_sPos + _viewSize.width / (2 * _sZoom));
+      want = {
+        for (var i = anchor - 2; i <= anchor + 2; i++)
+          if (i >= 0 && i <= _last) i,
+        for (var i = _index - 1; i <= _index + 1; i++)
+          if (i >= 0 && i <= _last) i,
+      };
+    } else {
+      want = {for (var i = _index - 1; i <= _index + 1; i++) if (i >= 0 && i <= _last) i};
+    }
     _cache.removeWhere((k, v) {
       final drop = !want.contains(k);
       if (drop) {
@@ -1196,18 +1296,37 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
       }
       return drop;
     });
+    _sCache.removeWhere((k, v) {
+      final drop = !want.contains(k);
+      if (drop) v.dispose();
+      return drop;
+    });
     for (final i in want) {
-      if (_cache.containsKey(i) || _loading.contains(i)) continue;
-      _loading.add(i);
       final gen = _fitGen;
-      _load(i, size, dpr).then((img) {
-        _loading.remove(i);
-        if (!mounted || size != _cacheSize || gen != _fitGen) {
-          img.dispose();
-          return;
-        }
-        setState(() => _cache[i] = img);
-      });
+      if (_turn == 1) {
+        // つながりでは、ページ全体の画像を用意する
+        if (_sCache.containsKey(i) || _sLoading.contains(i)) continue;
+        _sLoading.add(i);
+        _loadStrip(i, size, dpr).then((img) {
+          _sLoading.remove(i);
+          if (!mounted || size != _cacheSize || gen != _fitGen) {
+            img.dispose();
+            return;
+          }
+          setState(() => _sCache[i] = img);
+        });
+      } else {
+        if (_cache.containsKey(i) || _loading.contains(i)) continue;
+        _loading.add(i);
+        _load(i, size, dpr).then((img) {
+          _loading.remove(i);
+          if (!mounted || size != _cacheSize || gen != _fitGen) {
+            img.dispose();
+            return;
+          }
+          setState(() => _cache[i] = img);
+        });
+      }
     }
   }
 
@@ -1255,11 +1374,19 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
       _progress = 0;
       _acc = 0;
     });
+    if (_turn == 1) {
+      _dropHi(); // 拡大用画像は前のページのものなので捨てる
+      setState(() => _stripSnap = true); // 帯もそのページへ合わせる
+    }
     widget.book.lastPage = n;
     widget.onChanged?.call();
   }
 
   void _flip(int dir) {
+    if (_turn == 1) {
+      _stripFlip(dir); // つながりでは、1ページ分スライドする
+      return;
+    }
     if (_mode != 0 || _ac.isAnimating) return;
     if (dir == 1 && _index < _last) {
       setState(() {
@@ -1282,6 +1409,8 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
     final oldHi = _hi;
     _ac.stop();
     _fitGen++;
+    _stripAnimGen++;
+    _stripAnim = false;
     setState(() {
       _fit = mode;
       _mode = 0;
@@ -1289,6 +1418,9 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
       _acc = 0;
       _zoom = 1.0;
       _offset = Offset.zero;
+      _sZoom = 1.0;
+      _sOffY = 0;
+      _stripSnap = true; // 新しい段階の大きさで、帯も合わせ直す
       _hi = null;
       for (final img in _cache.values) {
         img.dispose();
@@ -1296,6 +1428,11 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
       _cache.clear();
       _rects.clear();
       _loading.clear();
+      for (final img in _sCache.values) {
+        img.dispose();
+      }
+      _sCache.clear();
+      _sLoading.clear();
       _cacheSize = Size.zero; // 次の描画で、新しい段階の大きさで読み直す
     });
     if (oldHi != null) {
@@ -1317,6 +1454,273 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
     _setFit(_fitCycle[(i + 1) % _fitCycle.length]);
   }
 
+  /* ---- めくり方の切り替え(カール ⇔ つながり) ---- */
+  /// 拡大用の高解像度画像を捨てる(描画が終わってから解放する)
+  void _dropHi() {
+    final old = _hi;
+    _hi = null;
+    if (old != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => old.dispose());
+    }
+  }
+
+  /// めくり方を切り替える。今のページは維持し、拡大はリセットする
+  void _setTurn(int mode, {bool announce = true}) {
+    _dropHi();
+    _ac.stop();
+    _stripAnimGen++;
+    _stripAnim = false;
+    setState(() {
+      _turn = mode;
+      _mode = 0;
+      _progress = 0;
+      _acc = 0;
+      _sZoom = 1.0;
+      _sOffY = 0;
+      _stripSnap = true; // つながりへ入ったら、今のページの位置に帯を合わせる
+    });
+    if (!announce) return;
+    Store.saveMode(mode);
+    final m = ScaffoldMessenger.of(context);
+    m.hideCurrentSnackBar();
+    m.showSnackBar(SnackBar(
+      content: Text(_turnNames[mode], textAlign: TextAlign.center),
+      duration: const Duration(milliseconds: 900),
+      behavior: SnackBarBehavior.floating,
+    ));
+  }
+
+  void _toggleTurn() => _setTurn(_turn == 0 ? 1 : 0);
+
+  /* ---- つながりモード: 帯の寸法 ---- */
+  // ページの幅と高さ。読み込み済みならその値、まだなら今のページと同じとみなす(本の中では大抵そろっている)
+  double _pageW(int i) => _rects[i]?.width ?? _rects[_index]?.width ?? _viewSize.width;
+  double _pageH(int i) => _rects[i]?.height ?? _rects[_index]?.height ?? _viewSize.height;
+
+  /// ページ i の左端の帯座標(先頭から幅を積み上げた位置)
+  double _cumW(int i) {
+    var s = 0.0;
+    for (var j = 0; j < i; j++) {
+      s += _pageW(j);
+    }
+    return s;
+  }
+
+  /// ページ i が画面の中央に来る帯のスクロール位置(拡大率 z のとき)
+  double _restPos(int i, double z) => _cumW(i) + _pageW(i) / 2 - _viewSize.width / (2 * z);
+
+  /// 帯座標 bx が含まれるページ番号
+  int _pageAt(double bx) {
+    if (bx <= 0) return 0;
+    var acc = 0.0;
+    for (var i = 0; i <= _last; i++) {
+      final w = _pageW(i);
+      if (bx < acc + w) return i;
+      acc += w;
+    }
+    return _last;
+  }
+
+  // 帯を流せる範囲。端のページの中までは見られるようにする
+  double _sMin(double z) => _restPos(0, z) - math.max(0.0, (_pageW(0) - _viewSize.width / z) / 2);
+  double _sMax(double z) =>
+      _restPos(_last, z) + math.max(0.0, (_pageW(_last) - _viewSize.width / z) / 2);
+  double _clampSPos(double p, double z) => p.clamp(_sMin(z), _sMax(z)).toDouble();
+
+  /// 縦のずらしの範囲。ページが画面より高い段階(画面いっぱい等)だけ、はみ出しの範囲で動ける
+  double _clampSOffY(double oy, double z) {
+    final h = _pageH(_index);
+    final top = (_viewSize.height - h) / 2;
+    if (z * h >= _viewSize.height) {
+      return oy.clamp(_viewSize.height - z * (top + h), -z * top).toDouble();
+    }
+    return (_viewSize.height - z * h) / 2 - z * top; // はみ出さないときは中央に固定
+  }
+
+  /* ---- つながりモード: ページ移動のアニメーション ---- */
+  void _stripFlip(int dir) {
+    if (_stripAnim) return;
+    final t = (_index + dir).clamp(0, _last).toInt();
+    if (t != _index) _stripAnimateTo(t);
+  }
+
+  /// 帯をページ target の位置まで滑らかに流す
+  void _stripAnimateTo(int target) {
+    final gen = ++_stripAnimGen;
+    _stripAnim = true;
+    final from = _sPos;
+    final to = _clampSPos(_restPos(target, _sZoom), _sZoom);
+    _ac.stop();
+    void tick() {
+      if (gen == _stripAnimGen && mounted) {
+        setState(() => _sPos = from + (to - from) * _ac.value);
+      }
+    }
+
+    _ac.addListener(tick);
+    _ac.value = 0;
+    _ac
+        .animateTo(1, duration: const Duration(milliseconds: 300), curve: Curves.easeOutCubic)
+        .whenComplete(() {
+      _ac.removeListener(tick);
+      if (!mounted || gen != _stripAnimGen) return;
+      _stripAnim = false;
+      final changed = target != _index;
+      setState(() {
+        _index = target;
+        _sPos = to;
+      });
+      if (changed) {
+        HapticFeedback.selectionClick();
+        if (_hi != null) {
+          _dropHi(); // 拡大用画像は前のページのものなので捨てて、今のページで取り直す
+          if (_sZoom > 1.001) _ensureHi();
+        }
+      }
+      widget.book.lastPage = target;
+      widget.onChanged?.call();
+    });
+  }
+
+  /* ---- つながりモード: 指の操作 ---- */
+  /// 画面の横位置 sx にある帯座標(右開きは左右が入れ替わる)
+  double _bxAt(double sx, double z, double pos) =>
+      pos + (_rtl ? (_viewSize.width - sx) : sx) / z;
+
+  void _onStripScaleStart(ScaleStartDetails d) {
+    _uiTimer?.cancel();
+    if (_ui) setState(() => _ui = false); // 流し始めたらメニューを消す
+    if (_stripAnim) {
+      _stripAnimGen++;
+      _stripAnim = false;
+      _ac.stop();
+    }
+    _sPinching = d.pointerCount >= 2;
+    _sStartPos = _sPos;
+    _sStartZoom = _sZoom;
+    _sStartOffY = _sOffY;
+    _sStartFocal = d.localFocalPoint;
+    _sGrabBx = _bxAt(d.localFocalPoint.dx, _sZoom, _sPos);
+    _sGrabPy = (d.localFocalPoint.dy - _sOffY) / _sZoom;
+  }
+
+  /// 途中から2本指になったとき、その時点をつかみ直す
+  void _regrabStrip(ScaleUpdateDetails d) {
+    _sPinching = true;
+    _sStartPos = _sPos;
+    _sStartZoom = _sZoom;
+    _sStartOffY = _sOffY;
+    _sStartFocal = d.localFocalPoint;
+    _sGrabBx = _bxAt(d.localFocalPoint.dx, _sZoom, _sPos);
+    _sGrabPy = (d.localFocalPoint.dy - _sOffY) / _sZoom;
+  }
+
+  void _onStripScaleUpdate(ScaleUpdateDetails d) {
+    if (!_sPinching && d.pointerCount >= 2) _regrabStrip(d);
+    if (_sPinching) {
+      // ピンチ: 指の下にある帯の点が指に付いてくるように、拡大と位置を決める
+      final z = (_sStartZoom * d.scale).clamp(1.0, 3.0).toDouble();
+      final inward = _rtl ? (_viewSize.width - d.localFocalPoint.dx) : d.localFocalPoint.dx;
+      setState(() {
+        _sZoom = z;
+        _sPos = _clampSPos(_sGrabBx - inward / z, z);
+        _sOffY = _clampSOffY(d.localFocalPoint.dy - _sGrabPy * z, z);
+      });
+      if (z > 1.001) _ensureHi();
+      return;
+    }
+    // 1本指: 横は帯を流し(右開きは向きが逆)、縦ははみ出しの範囲でずらす
+    final dx = d.localFocalPoint.dx - _sStartFocal.dx;
+    final dy = d.localFocalPoint.dy - _sStartFocal.dy;
+    setState(() {
+      _sPos = _clampSPos(_sStartPos + (_rtl ? dx : -dx) / _sZoom, _sZoom);
+      _sOffY = _clampSOffY(_sStartOffY + dy, _sZoom);
+    });
+  }
+
+  void _onStripScaleEnd(ScaleEndDetails d) {
+    if (_sPinching) {
+      _sPinching = false;
+      if (_sZoom < 1.05) {
+        // ほぼ等倍まで戻したら、近いページへ寄せる
+        setState(() {
+          _sZoom = 1.0;
+          _sPos = _clampSPos(_sPos, 1.0);
+          _sOffY = _clampSOffY(_sOffY, 1.0);
+        });
+        _stripAnimateTo(_pageAt(_sPos + _viewSize.width / 2));
+      }
+      return;
+    }
+    // 離した時、画面の真ん中に一番近いページが「今のページ」になる。払いが強ければ、その向きへ1ページ進む
+    final vRead = _rtl ? d.velocity.pixelsPerSecond.dx : -d.velocity.pixelsPerSecond.dx;
+    var target = _pageAt(_sPos + _viewSize.width / (2 * _sZoom));
+    if (vRead > _flickSpeed) target = math.max(target, _index + 1);
+    if (vRead < -_flickSpeed) target = math.min(target, _index - 1);
+    _stripAnimateTo(target.clamp(0, _last).toInt());
+  }
+
+  void _onStripTapUp(TapUpDetails d, Size size) {
+    final now = DateTime.now();
+    final isDouble = now.difference(_lastTap).inMilliseconds < 300;
+    _lastTap = now;
+    final x = d.localPosition.dx / size.width;
+    final center = x >= 0.3 && x <= 0.7;
+    if (_sZoom > 1.001) {
+      if (isDouble) {
+        // 拡大中のダブルタップで等倍に戻し、今のページへ寄せる
+        _dropHi();
+        setState(() {
+          _sZoom = 1.0;
+          _sPos = _clampSPos(_sPos, 1.0);
+          _sOffY = _clampSOffY(_sOffY, 1.0);
+        });
+        _stripAnimateTo(_pageAt(_sPos + _viewSize.width / 2));
+      }
+      return;
+    }
+    if (center) {
+      _uiTimer?.cancel();
+      setState(() => _ui = !_ui);
+      return;
+    }
+    if (_ui) setState(() => _ui = false);
+    if (x < 0.3) _flip(_rtl ? 1 : -1);
+    if (x > 0.7) _flip(_rtl ? -1 : 1);
+  }
+
+  /* ---- つながりモード: 描くページの一覧 ---- */
+  List<_StripItem> _stripItems(Size size) {
+    final items = <_StripItem>[];
+    final w = size.width;
+    var cum = 0.0;
+    for (var i = 0; i <= _last; i++) {
+      final pw = _pageW(i);
+      final img = _sCache[i]; // ページ全体(端まで全部)の画像
+      if (img != null) {
+        final rect = _rects[i];
+        final ph = _pageH(i);
+        final top = rect?.top ?? (size.height - ph) / 2;
+        final exLeft = _sZoom * (cum - _sPos); // 帯の左端(左開きの向きで見た位置)
+        final dstW = _sZoom * pw;
+        final dstLeft = _rtl ? (w - exLeft - dstW) : exLeft; // 右開きは次のページが左に来る
+        final dst = Rect.fromLTWH(dstLeft, _sZoom * top + _sOffY, dstW, _sZoom * ph);
+        if (dst.right > -50 && dst.left < w + 50) {
+          if (_sZoom > 1.001 && i == _index && _hi != null) {
+            // 拡大中は、今のページだけ高解像度画像で描く
+            items.add(_StripItem(
+                _hi!, Rect.fromLTWH(0, 0, _hi!.width.toDouble(), _hi!.height.toDouble()), dst, true));
+          } else {
+            items.add(
+                _StripItem(img, Rect.fromLTWH(0, 0, img.width.toDouble(), img.height.toDouble()), dst, false));
+          }
+        }
+      }
+      cum += pw;
+    }
+    return items;
+  }
+
   /* ---- ピンチズーム ---- */
   Offset _clampOffset(Offset o, double z) {
     final w = _viewSize.width, h = _viewSize.height;
@@ -1334,7 +1738,7 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
       final codec =
           await ui.instantiateImageCodec(bytes, targetWidth: targetW, allowUpscaling: false);
       final img = (await codec.getNextFrame()).image;
-      if (!mounted || _zoom <= 1.001 || idx != _index) {
+      if (!mounted || (_zoom <= 1.001 && _sZoom <= 1.001) || idx != _index) {
         img.dispose();
       } else {
         setState(() => _hi = img);
@@ -1451,6 +1855,12 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
                   overflow: TextOverflow.ellipsis,
                   style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
             ),
+            // めくり方ボタン(カールめくり ⇔ つながり)
+            IconButton(
+              icon: Icon(_turnIcons[_turn], color: Colors.white),
+              tooltip: _turnNames[_turn],
+              onPressed: _toggleTurn,
+            ),
             // 大きさ3段階ボタン(押すたびに 幅いっぱい→画面いっぱい→まるごと＋余白 と形が変わる)
             IconButton(
               icon: Icon(_fitIcons[_fit], color: Colors.white),
@@ -1504,6 +1914,18 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
                   setState(() => _rtl = !_rtl);
                   widget.book.rtl = _rtl; // 次に開いたときも同じ向きになる
                   widget.onChanged?.call();
+                  if (_turn == 1) {
+                    // つながりでは、開き方を変えたら1ページ目に戻る(帯の並びが入れ替わるため)
+                    _stripAnimGen++;
+                    _stripAnim = false;
+                    _ac.stop();
+                    setState(() {
+                      _index = 0;
+                      _stripSnap = true;
+                    });
+                    widget.book.lastPage = 0;
+                    widget.onChanged?.call();
+                  }
                 },
                 style: OutlinedButton.styleFrom(
                     foregroundColor: Colors.white, side: const BorderSide(color: Colors.white38)),
@@ -1534,6 +1956,31 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
         final cur = _cache[curIdx];
         final next = _cache[nextIdx];
         final ready = _shader != null && cur != null && next != null;
+
+        if (_turn == 1) {
+          // つながりモード: ページを横一列につなげた帯を、そのまま滑らせる(シェーダーは使わない)
+          if (_stripSnap && !_stripAnim && _rects.containsKey(_index)) {
+            _sPos = _clampSPos(_restPos(_index, _sZoom), _sZoom);
+            _stripSnap = false;
+          }
+          final items = _stripItems(size);
+          return Stack(fit: StackFit.expand, children: [
+            Positioned.fill(
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onScaleStart: _onStripScaleStart,
+                onScaleUpdate: _onStripScaleUpdate,
+                onScaleEnd: _onStripScaleEnd,
+                onTapUp: (d) => _onStripTapUp(d, size),
+                child: items.isNotEmpty
+                    ? CustomPaint(painter: _StripPainter(items))
+                    : const Center(child: CircularProgressIndicator()),
+              ),
+            ),
+            if (_ui) _buildTopBar(),
+            if (_ui) _buildBottomPanel(),
+          ]);
+        }
 
         return Stack(fit: StackFit.expand, children: [
           Positioned.fill(
@@ -1653,6 +2100,33 @@ class _ZoomPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _ZoomPainter old) => true;
+}
+
+/// つながりモードで描くページ1つ分(切り取る部分と、画面に置く場所)
+class _StripItem {
+  _StripItem(this.img, this.src, this.dst, this.hi);
+  final ui.Image img;
+  final Rect src;
+  final Rect dst;
+  final bool hi; // 高解像度画像かどうか
+}
+
+/// つながりモード用。ページを横一列につなげて描く(カールの曲がりは無い)
+class _StripPainter extends CustomPainter {
+  _StripPainter(this.items);
+  final List<_StripItem> items;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final p = Paint();
+    for (final it in items) {
+      p.filterQuality = it.hi ? FilterQuality.high : FilterQuality.medium;
+      canvas.drawImageRect(it.img, it.src, it.dst, p);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _StripPainter old) => true;
 }
 
 
