@@ -50,7 +50,9 @@ workflows:
 
       - name: Build APK
         script: |
-          flutter build apk --debug
+          # 製品版(AOTコンパイル・最適化あり)でビルドする。デバッグ版(JIT)より描画が速い。
+          # 署名は android/app/build.gradle 側で今までと同じデバッグ鍵のままなので、上書きインストールできる
+          flutter build apk --release
 
       - name: Verify APK contains new name and icon
         script: |
