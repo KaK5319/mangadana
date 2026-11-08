@@ -78,9 +78,11 @@ workflows:
             exit 1
           }
           echo "label check OK: application-label is 漫画棚"
-          # 2) アイコン: APK内の xxxhdpi ic_launcher.png が icons.b64 と一致すること
-          python3 - "$APK" <<'PYEOF'
-          import base64, hashlib, io, struct, sys, zipfile, zlib
+          # 2) アイコン: APK内の xxxhdpi(density 640)アイコンが icons.b64 と一致すること。
+          #    実ファイル名は aapt2 badging の application-icon-640 から取る
+          #    (製品版ではリソース名が短縮され、zip内の名前パターンでは探せないため)
+          python3 - "$APK" /tmp/badging.txt <<'PYEOF'
+          import base64, hashlib, io, re, struct, sys, zipfile, zlib
 
           def png_rgba(data):
               assert data[:8] == b"\x89PNG\r\n\x1a\n", "not a PNG"
@@ -145,10 +147,17 @@ workflows:
           apk = zipfile.ZipFile(sys.argv[1])
           want = zipfile.ZipFile(io.BytesIO(base64.b64decode(
               open("icon/icons.b64", "rb").read()))).read("mipmap-xxxhdpi/ic_launcher.png")
-          cands = [n for n in apk.namelist() if n.endswith("ic_launcher.png") and "xxxhdpi" in n]
-          assert cands, "FAIL: no xxxhdpi ic_launcher.png in APK"
-          got = apk.read(cands[0])
-          print("APK icon entry:", cands[0], len(got), "bytes")
+          # APK内のアイコンの実ファイル名は、aapt2 dump badging の
+          # application-icon-640(density 640 = xxxhdpi 相当)から取る。
+          # 製品版(release)ではリソース名が短縮されて res/o-.png のようになり、
+          # zip内の名前パターンでは探せない。badging はビルド形式によらず
+          # 実際に使われているアイコンの名前を返すので、debug でも release でも動く
+          m = re.search(r"application-icon-640:'([^']+)'",
+                        open(sys.argv[2], encoding="utf-8").read())
+          assert m, "FAIL: no application-icon-640 entry in aapt2 badging"
+          entry = m.group(1)
+          got = apk.read(entry)
+          print("APK icon entry:", entry, len(got), "bytes")
           if hashlib.sha256(got).hexdigest() == hashlib.sha256(want).hexdigest():
               print("icon check OK: bytes identical to icons.b64")
           else:
