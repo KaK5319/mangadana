@@ -2124,12 +2124,7 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
         child: SafeArea(
           bottom: false,
           child: Row(children: [
-            OutlinedButton(
-              onPressed: () => Navigator.pop(context),
-              style: OutlinedButton.styleFrom(
-                  foregroundColor: Colors.white, side: const BorderSide(color: Colors.white38)),
-              child: const Text('戻る'),
-            ),
+            // 「戻る」は下のパネル右端へ移した(片手持ちで左上は親指が届かないため)
             Expanded(
               child: Text(widget.book.title,
                   textAlign: TextAlign.center,
@@ -2176,8 +2171,20 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
         child: SafeArea(
           top: false,
           child: Column(mainAxisSize: MainAxisSize.min, children: [
-            Text('$shown / $total',
-                style: const TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.w600)),
+            // ページ数は中央のまま、右端に「戻る」を置く(上のバーから移した。片手でも親指で押せる位置)
+            Stack(alignment: Alignment.center, children: [
+              Text('$shown / $total',
+                  style: const TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.w600)),
+              Align(
+                alignment: Alignment.centerRight,
+                child: OutlinedButton(
+                  onPressed: () => Navigator.pop(context),
+                  style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.white, side: const BorderSide(color: Colors.white38)),
+                  child: const Text('戻る'),
+                ),
+              ),
+            ]),
             // 右開きのときは、スライダーも右が1ページ目になる
             Directionality(
               textDirection: _rtl ? TextDirection.rtl : TextDirection.ltr,
