@@ -37,3 +37,11 @@ android {
 flutter {
     source = "../.."
 }
+
+dependencies {
+    // RAR(RAR5含む)の展開をAndroid側で行うための純Javaライブラリ Junrar。
+    // 従来の rar プラグイン(同梱 libarchive 3.7.2)は RAR5 でアプリごと落ちたため、
+    // 展開はこちらに差し替える。失敗しても Java の例外として受け取れる。
+    // バージョンは Maven Central の最新安定版 8.1.2(2026-10-10公開)
+    implementation "com.github.junrar:junrar:8.1.2"
+}
