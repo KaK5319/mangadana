@@ -1240,6 +1240,7 @@ class _ShelfState extends State<Shelf> with TickerProviderStateMixin {
 /* ---------------- 並び替え(映画棚式のリスト画面) ---------------- */
 /// この本棚の本を、縦リストで並び替える画面(映画棚アプリ式)。
 /// 左の ≡ ハンドルを掴んでドラッグすると行が入れ替わり、その場で保存される。
+/// ハンドル以外の行タップで名前変更もできる(ダイアログは棚画面と共通の _RenameDialog)。
 /// 棚の上の長押しドラッグ並び替えとは別物で、両方使える
 class BookReorderPage extends StatefulWidget {
   const BookReorderPage({super.key, required this.info});
@@ -1267,6 +1268,19 @@ class _BookReorderPageState extends State<BookReorderPage> {
       all[slots[k]] = _list[k];
     }
     AppData.I.save();
+  }
+
+  /// 行(ハンドル以外)をタップした時の名前変更。棚画面の _rename と同じ流儀で、
+  /// ダイアログは共通の _RenameDialog を使い、空の名前は保存しない。
+  /// タイトルだけの変更なので、並び順には影響しない
+  Future<void> _rename(Book b) async {
+    final name = await showDialog<String>(
+      context: context,
+      builder: (c) => _RenameDialog(initial: b.title),
+    );
+    if (name == null || name.isEmpty) return;
+    setState(() => b.title = name);
+    await AppData.I.save();
   }
 
   @override
@@ -1322,49 +1336,74 @@ class _BookReorderPageState extends State<BookReorderPage> {
                       child: Material(
                         color: const Color(0xFF6B4423),
                         borderRadius: BorderRadius.circular(14),
-                        child: Padding(
-                          padding: const EdgeInsets.all(10),
-                          child: Row(children: [
-                            ReorderableDragStartListener(
+                        child: Row(children: [
+                          // ≡ ハンドルは並び替え専用。タップ判定(InkWell)の外に置く
+                          Padding(
+                            padding: const EdgeInsets.only(left: 10),
+                            child: ReorderableDragStartListener(
                               index: i,
                               child: const Padding(
                                 padding: EdgeInsets.all(8),
-                                child: Icon(Icons.drag_handle, color: Color(0xFFD9B98A)),
+                                child: Icon(Icons.drag_handle,
+                                    color: Color(0xFFD9B98A)),
                               ),
                             ),
-                            const SizedBox(width: 6),
-                            SizedBox(
-                              width: 40,
-                              height: 56,
-                              child: b.pages.isEmpty
-                                  ? const DecoratedBox(
-                                      decoration: BoxDecoration(color: Color(0xFF4A2D14)),
-                                      child: Icon(Icons.menu_book,
-                                          color: Color(0xFFD9B98A), size: 20),
-                                    )
-                                  : Image.file(File(b.pages.first),
-                                      fit: BoxFit.cover, cacheWidth: 200),
+                          ),
+                          const SizedBox(width: 6),
+                          // ハンドル以外の行全体がタップ領域(タップで名前変更)
+                          Expanded(
+                            child: InkWell(
+                              onTap: () => _rename(b),
+                              borderRadius: const BorderRadius.only(
+                                  topRight: Radius.circular(14),
+                                  bottomRight: Radius.circular(14)),
+                              child: Padding(
+                                padding:
+                                    const EdgeInsets.fromLTRB(0, 10, 10, 10),
+                                child: Row(children: [
+                                  SizedBox(
+                                    width: 40,
+                                    height: 56,
+                                    child: b.pages.isEmpty
+                                        ? const DecoratedBox(
+                                            decoration: BoxDecoration(
+                                                color: Color(0xFF4A2D14)),
+                                            child: Icon(Icons.menu_book,
+                                                color: Color(0xFFD9B98A),
+                                                size: 20),
+                                          )
+                                        : Image.file(File(b.pages.first),
+                                            fit: BoxFit.cover, cacheWidth: 200),
+                                  ),
+                                  const SizedBox(width: 12),
+                                  Expanded(
+                                    child: Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          Text(b.title,
+                                              maxLines: 2,
+                                              overflow: TextOverflow.ellipsis,
+                                              style: const TextStyle(
+                                                  fontSize: 17,
+                                                  fontWeight: FontWeight.w700,
+                                                  color: Color(0xFFF1D9B5))),
+                                          const SizedBox(height: 3),
+                                          Text('${b.pages.length}ページ',
+                                              style: const TextStyle(
+                                                  color: Color(0xFFD9B98A),
+                                                  fontSize: 13)),
+                                        ]),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  // 名前変更できる目印(鉛筆)
+                                  const Icon(Icons.edit,
+                                      size: 19, color: Color(0xFFD9B98A)),
+                                ]),
+                              ),
                             ),
-                            const SizedBox(width: 12),
-                            Expanded(
-                              child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(b.title,
-                                        maxLines: 2,
-                                        overflow: TextOverflow.ellipsis,
-                                        style: const TextStyle(
-                                            fontSize: 17,
-                                            fontWeight: FontWeight.w700,
-                                            color: Color(0xFFF1D9B5))),
-                                    const SizedBox(height: 3),
-                                    Text('${b.pages.length}ページ',
-                                        style: const TextStyle(
-                                            color: Color(0xFFD9B98A), fontSize: 13)),
-                                  ]),
-                            ),
-                          ]),
-                        ),
+                          ),
+                        ]),
                       ),
                     );
                   },
