@@ -1192,6 +1192,20 @@ class _ShelfState extends State<Shelf> with TickerProviderStateMixin {
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
             style: const TextStyle(fontWeight: FontWeight.w800, letterSpacing: 1.2, color: Color(0xFFF1D9B5))),
+        actions: [
+          // 映画棚式の並び替え画面(リストで≡をドラッグ)への入口。本が少なくても開ける。
+          // 取り込み中は押せない(裏で本が増えている最中に並び替えると競合するため)
+          TextButton(
+            onPressed: _busy
+                ? null
+                : () => Navigator.push(
+                      context,
+                      MaterialPageRoute(builder: (_) => BookReorderPage(info: widget.info)),
+                    ).then((_) => setState(() {})), // 戻ったら新しい順で棚を描き直す
+            child: const Text('並び替え',
+                style: TextStyle(color: Color(0xFFF1D9B5), fontSize: 16)),
+          ),
+        ],
       ),
       body: _busy
           ? Center(
@@ -1219,6 +1233,144 @@ class _ShelfState extends State<Shelf> with TickerProviderStateMixin {
             ),
       floatingActionButton: FloatingActionButton.extended(
           onPressed: _showAddMenu, icon: const Icon(Icons.add), label: const Text('本を追加')),
+    );
+  }
+}
+
+/* ---------------- 並び替え(映画棚式のリスト画面) ---------------- */
+/// この本棚の本を、縦リストで並び替える画面(映画棚アプリ式)。
+/// 左の ≡ ハンドルを掴んでドラッグすると行が入れ替わり、その場で保存される。
+/// 棚の上の長押しドラッグ並び替えとは別物で、両方使える
+class BookReorderPage extends StatefulWidget {
+  const BookReorderPage({super.key, required this.info});
+  final ShelfInfo info;
+  @override
+  State<BookReorderPage> createState() => _BookReorderPageState();
+}
+
+class _BookReorderPageState extends State<BookReorderPage> {
+  late List<Book> _list; // この本棚の本だけ(表示順)
+
+  @override
+  void initState() {
+    super.initState();
+    _list = AppData.I.booksOf(widget.info.id);
+  }
+
+  /// 並び替えた順を、全体の本リストの中で「この本棚の本が入っている場所」へ
+  /// 入れ直して保存する。他の本棚の本の場所は動かさない
+  /// (棚の上のドラッグ並び替え _dragEnd と同じやり方)
+  void _applyAndSave() {
+    final all = AppData.I.books;
+    final slots = <int>[for (var i = 0; i < all.length; i++) if (all[i].shelfId == widget.info.id) i];
+    for (var k = 0; k < slots.length && k < _list.length; k++) {
+      all[slots[k]] = _list[k];
+    }
+    AppData.I.save();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFF2A1809),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF1C0F05),
+        foregroundColor: const Color(0xFFF1D9B5),
+        title: Text(widget.info.name,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+                fontWeight: FontWeight.w800, letterSpacing: 1.2, color: Color(0xFFF1D9B5))),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child:
+                const Text('完了', style: TextStyle(color: Color(0xFFF1D9B5), fontSize: 16)),
+          ),
+        ],
+      ),
+      body: Column(children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 14, 16, 4),
+          child: Center(
+            child: Text('全${_list.length}冊',
+                style: const TextStyle(color: Color(0xFFD9B98A), fontSize: 15)),
+          ),
+        ),
+        Expanded(
+          child: _list.isEmpty
+              ? const Center(
+                  child: Text('この本棚には、まだ本がありません',
+                      style: TextStyle(color: Color(0xFFD9B98A))))
+              : ReorderableListView.builder(
+                  padding: const EdgeInsets.fromLTRB(0, 6, 0, 40),
+                  buildDefaultDragHandles: false, // 行全体ではなく、≡ を掴んだ時だけ動く(映画棚式)
+                  itemCount: _list.length,
+                  onReorder: (o, n) {
+                    setState(() {
+                      if (n > o) n -= 1;
+                      final b = _list.removeAt(o);
+                      _list.insert(n, b);
+                    });
+                    _applyAndSave(); // 入れ替えたその場で保存する(映画棚式)
+                  },
+                  itemBuilder: (c, i) {
+                    final b = _list[i];
+                    return Padding(
+                      key: ValueKey(b.id),
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+                      child: Material(
+                        color: const Color(0xFF6B4423),
+                        borderRadius: BorderRadius.circular(14),
+                        child: Padding(
+                          padding: const EdgeInsets.all(10),
+                          child: Row(children: [
+                            ReorderableDragStartListener(
+                              index: i,
+                              child: const Padding(
+                                padding: EdgeInsets.all(8),
+                                child: Icon(Icons.drag_handle, color: Color(0xFFD9B98A)),
+                              ),
+                            ),
+                            const SizedBox(width: 6),
+                            SizedBox(
+                              width: 40,
+                              height: 56,
+                              child: b.pages.isEmpty
+                                  ? const DecoratedBox(
+                                      decoration: BoxDecoration(color: Color(0xFF4A2D14)),
+                                      child: Icon(Icons.menu_book,
+                                          color: Color(0xFFD9B98A), size: 20),
+                                    )
+                                  : Image.file(File(b.pages.first),
+                                      fit: BoxFit.cover, cacheWidth: 200),
+                            ),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(b.title,
+                                        maxLines: 2,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: const TextStyle(
+                                            fontSize: 17,
+                                            fontWeight: FontWeight.w700,
+                                            color: Color(0xFFF1D9B5))),
+                                    const SizedBox(height: 3),
+                                    Text('${b.pages.length}ページ',
+                                        style: const TextStyle(
+                                            color: Color(0xFFD9B98A), fontSize: 13)),
+                                  ]),
+                            ),
+                          ]),
+                        ),
+                      ),
+                    );
+                  },
+                ),
+        ),
+      ]),
     );
   }
 }
