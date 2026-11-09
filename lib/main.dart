@@ -159,6 +159,8 @@ Future<String> sniffKind(String path) async {
   final h = await raf.read(8);
   await raf.close();
   if (h.length >= 4 && h[0] == 0x50 && h[1] == 0x4B) return 'zip'; // PK
+  // RAR5 の署名は "Rar!" + 1A 07 01 00、RAR(〜4系)は "Rar!" + 1A 07 00。5かどうかで扱いが変わるので分ける
+  if (h.length >= 7 && h[0] == 0x52 && h[1] == 0x61 && h[2] == 0x72 && h[3] == 0x21 && h[4] == 0x1A && h[5] == 0x07 && h[6] == 0x01) return 'rar5';
   if (h.length >= 4 && h[0] == 0x52 && h[1] == 0x61 && h[2] == 0x72 && h[3] == 0x21) return 'rar'; // Rar!
   if (h.length >= 4 && h[0] == 0x25 && h[1] == 0x50 && h[2] == 0x44 && h[3] == 0x46) return 'pdf'; // %PDF
   return 'unknown';
@@ -341,6 +343,37 @@ class Store {
     final dir = Directory('${d.path}/books/${b.id}');
     if (await dir.exists()) await dir.delete(recursive: true);
   }
+
+  /// RAR取り込みの「目印」。展開はネイティブ側(rarプラグイン)で行うため、ファイルに
+  /// よってはエラーとして返らずアプリごと落ちてしまうことがある。開始前に目印を残し、
+  /// 正常に終わったら消す。起動時に目印が残っていたら「前回は途中で落ちた」と分かる
+  static Future<File> _rarAttemptFile() async {
+    final d = await getApplicationDocumentsDirectory();
+    return File('${d.path}/rar_attempt.txt');
+  }
+
+  static Future<void> markRarAttempt(String info) async {
+    try {
+      await (await _rarAttemptFile()).writeAsString(info);
+    } catch (_) {}
+  }
+
+  static Future<String?> readRarAttempt() async {
+    try {
+      final f = await _rarAttemptFile();
+      if (!await f.exists()) return null;
+      return await f.readAsString();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static Future<void> clearRarAttempt() async {
+    try {
+      final f = await _rarAttemptFile();
+      if (await f.exists()) await f.delete();
+    } catch (_) {}
+  }
 }
 
 /* ---------------- 本棚 ---------------- */
@@ -469,12 +502,24 @@ class _ShelfState extends State<Shelf> with TickerProviderStateMixin {
       final List<String> paths;
       if (kind == 'pdf') {
         paths = await Store.importPdf(path, dir, (i, n) => onStatus('変換中 $i / $n ページ'));
+      } else if (kind == 'rar5') {
+        // RAR5は展開部品(rarプラグインの libarchive)の中でアプリごと落ちてしまい、
+        // エラーとして受け取れないことが実機で繰り返し起きている。ネイティブ展開には
+        // 渡さず、落ちる前に理由と代わりの入れ方を伝える
+        throw 'RAR5形式のファイルでした。いまの展開の仕組みでは、取り込むとアプリが落ちてしまうため、そのままでは入れられません。パソコンや「RAR」アプリで zip に変換してから入れてください';
       } else if (kind == 'rar') {
         onStatus('RARを展開中…(少し時間がかかります)');
         final tmp = Directory('${dir.path}/_rar');
         await tmp.create(recursive: true);
-        final r = await Rar.extractRarFile(rarFilePath: path, destinationPath: tmp.path);
-        if (r['success'] != true) throw (r['message'] ?? 'RARを展開できませんでした');
+        // 展開中にアプリが落ちても次回起動時に分かるよう、開始前に目印を残す(正常に終われば消える)
+        final sizeMb = (await File(path).length() / (1024 * 1024)).toStringAsFixed(0);
+        await Store.markRarAttempt('ファイル名: ${f.name}\n形式: RAR(4系以前)\n大きさ: 約${sizeMb}MB');
+        try {
+          final r = await Rar.extractRarFile(rarFilePath: path, destinationPath: tmp.path);
+          if (r['success'] != true) throw (r['message'] ?? 'RARを展開できませんでした');
+        } finally {
+          await Store.clearRarAttempt();
+        }
         paths = await compute(collectImages, [tmp.path, dir.path]);
         if (await tmp.exists()) await tmp.delete(recursive: true);
       } else {
@@ -555,8 +600,11 @@ class _ShelfState extends State<Shelf> with TickerProviderStateMixin {
           AppData.I.books.add(book);
           await AppData.I.save(); // 1冊ごとに保存する(途中で離れても、入った分は残る)
           added++;
-        } catch (_) {
-          failed.add(f.name); // 壊れているファイルは飛ばして次へ
+        } catch (e) {
+          // 壊れている・対応できないファイルは理由つきで記録して次へ
+          var reason = e.toString();
+          if (reason.length > 80) reason = '${reason.substring(0, 80)}…';
+          failed.add('${f.name}（$reason）');
         }
       }
     } finally {
@@ -2658,6 +2706,29 @@ class _HomePageState extends State<HomePage> {
     super.initState();
     AppData.I.load().then((_) {
       if (mounted) setState(() {});
+    });
+    _checkRarAttempt();
+  }
+
+  /// 前回のRAR取り込みが途中で終わっていたら(落ちた目印が残っていたら)、
+  /// 何が起きたかと、次にどうすれば入れられるかを伝える
+  Future<void> _checkRarAttempt() async {
+    final info = await Store.readRarAttempt();
+    if (info == null) return;
+    await Store.clearRarAttempt();
+    if (!mounted) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      showDialog<void>(
+        context: context,
+        builder: (c) => AlertDialog(
+          title: const Text('前回のRAR取り込みについて'),
+          content: Text('前回、このRARファイルの取り込みが途中で終わっていました（アプリが落ちた可能性があります）。\n\n$info\n\nお手数ですが、このファイルはパソコンや「RAR」アプリで zip に変換してから入れ直してみてください。'),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(c), child: const Text('閉じる')),
+          ],
+        ),
+      );
     });
   }
 
