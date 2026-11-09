@@ -964,8 +964,10 @@ class _ShelfState extends State<Shelf> with TickerProviderStateMixin {
                         overflow: TextOverflow.ellipsis,
                         style: TextStyle(color: Colors.white, fontSize: titleSize)),
                     const SizedBox(height: 3),
+                    // 進捗バーは赤(映画棚の「つづき」と同じ赤系)。端まで赤くなれば読み終わりと分かる
                     LinearProgressIndicator(
                       value: progress.clamp(0.0, 1.0),
+                      valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFFE53935)),
                       minHeight: 3,
                       backgroundColor: Colors.white24,
                     ),
