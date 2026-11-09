@@ -14,7 +14,6 @@ import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:pdfx/pdfx.dart' show PdfDocument, PdfPageImageFormat;
-import 'package:rar/rar.dart' show Rar;
 
 /// ページの外の背景色(page_curl.frag の BG と同じ明るさ)
 const Color _bg = Color(0xFF1F1F1F);
@@ -111,6 +110,20 @@ bool _isImageName(String n) {
       l.endsWith('.webp') ||
       l.endsWith('.gif') ||
       l.endsWith('.bmp');
+}
+
+/// RARの展開を Android 側(Junrar・純Java)に任せるためのチャネル。
+/// 旧 rar プラグイン(同梱 libarchive 3.7.2)は RAR5 でアプリごと落ちたため使わない。
+/// Java側の失敗は PlatformException として受け取れるので、通常の失敗表示で済む
+const _rarChannel = MethodChannel('com.example.mangadana/rar');
+
+/// Android側でRAR(rar5含む)を展開し、展開先フォルダに中身を書き出してもらう。
+/// 失敗したら PlatformException が飛ぶので、呼び出し側で読みやすい文言に変える
+Future<void> extractRarViaAndroid(String rarPath, String destDir) async {
+  await _rarChannel.invokeMethod<List<dynamic>>('extractRar', {
+    'rarPath': rarPath,
+    'destDir': destDir,
+  });
 }
 
 /// zip / cbz を展開して、画像だけをページ順に保存する(別スレッドで実行)
@@ -344,9 +357,9 @@ class Store {
     if (await dir.exists()) await dir.delete(recursive: true);
   }
 
-  /// RAR取り込みの「目印」。展開はネイティブ側(rarプラグイン)で行うため、ファイルに
-  /// よってはエラーとして返らずアプリごと落ちてしまうことがある。開始前に目印を残し、
-  /// 正常に終わったら消す。起動時に目印が残っていたら「前回は途中で落ちた」と分かる
+  /// RAR取り込みの「目印」。展開はAndroid側(Junrar)で行うが、万一アプリごと
+  /// 落ちてしまった場合に備える安全網。開始前に目印を残し、正常に終わったら消す。
+  /// 起動時に目印が残っていたら「前回は途中で落ちた」と分かる
   static Future<File> _rarAttemptFile() async {
     final d = await getApplicationDocumentsDirectory();
     return File('${d.path}/rar_attempt.txt');
@@ -502,21 +515,22 @@ class _ShelfState extends State<Shelf> with TickerProviderStateMixin {
       final List<String> paths;
       if (kind == 'pdf') {
         paths = await Store.importPdf(path, dir, (i, n) => onStatus('変換中 $i / $n ページ'));
-      } else if (kind == 'rar5') {
-        // RAR5は展開部品(rarプラグインの libarchive)の中でアプリごと落ちてしまい、
-        // エラーとして受け取れないことが実機で繰り返し起きている。ネイティブ展開には
-        // 渡さず、落ちる前に理由と代わりの入れ方を伝える
-        throw 'RAR5形式のファイルでした。いまの展開の仕組みでは、取り込むとアプリが落ちてしまうため、そのままでは入れられません。パソコンや「RAR」アプリで zip に変換してから入れてください';
-      } else if (kind == 'rar') {
+      } else if (kind == 'rar' || kind == 'rar5') {
+        // RARの展開は Android 側の Junrar(純Java)に任せる。旧 rar プラグイン
+        // (同梱 libarchive 3.7.2)は RAR5 でアプリごと落ちたが、Java側の失敗は
+        // PlatformException として受け取れるので、通常の失敗表示で済む。
+        // RAR5 もそのまま取り込める
         onStatus('RARを展開中…(少し時間がかかります)');
         final tmp = Directory('${dir.path}/_rar');
         await tmp.create(recursive: true);
         // 展開中にアプリが落ちても次回起動時に分かるよう、開始前に目印を残す(正常に終われば消える)
         final sizeMb = (await File(path).length() / (1024 * 1024)).toStringAsFixed(0);
-        await Store.markRarAttempt('ファイル名: ${f.name}\n形式: RAR(4系以前)\n大きさ: 約${sizeMb}MB');
+        final kindLabel = kind == 'rar5' ? 'RAR5' : 'RAR(4系以前)';
+        await Store.markRarAttempt('ファイル名: ${f.name}\n形式: $kindLabel\n大きさ: 約${sizeMb}MB');
         try {
-          final r = await Rar.extractRarFile(rarFilePath: path, destinationPath: tmp.path);
-          if (r['success'] != true) throw (r['message'] ?? 'RARを展開できませんでした');
+          await extractRarViaAndroid(path, tmp.path);
+        } on PlatformException catch (e) {
+          throw 'RARを展開できませんでした: ${e.message ?? e.code}';
         } finally {
           await Store.clearRarAttempt();
         }
@@ -2723,7 +2737,7 @@ class _HomePageState extends State<HomePage> {
         context: context,
         builder: (c) => AlertDialog(
           title: const Text('前回のRAR取り込みについて'),
-          content: Text('前回、このRARファイルの取り込みが途中で終わっていました（アプリが落ちた可能性があります）。\n\n$info\n\nお手数ですが、このファイルはパソコンや「RAR」アプリで zip に変換してから入れ直してみてください。'),
+          content: Text('前回、このRARファイルの取り込みが途中で終わっていました（アプリが落ちた可能性があります）。\n\n$info\n\nお手数ですが、もう一度入れてみて、それでもダメな時はパソコンや「RAR」アプリで zip に変換してから入れてみてください。'),
           actions: [
             TextButton(onPressed: () => Navigator.pop(c), child: const Text('閉じる')),
           ],
