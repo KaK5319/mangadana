@@ -1153,7 +1153,6 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
 
   // ピンチズーム ------------------------------------------
   static const double _maxZoom = 4.0;     // 最大の拡大率
-  static const double _doubleTapZoom = 2.5; // ダブルタップで拡大する倍率
   double _zoom = 1.0;
   Offset _offset = Offset.zero;
   double _startZoom = 1.0;
@@ -1164,8 +1163,17 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
 
   // メニュー(中央を1回タップで表示/非表示) ---------------------
   bool _ui = false;
-  Timer? _uiTimer;
   int? _dragPage; // スライダーをつまんでいる間のページ番号(1始まり)
+
+  // タップのブレ許容 ----------------------------------------
+  // 指が少し動くとドラッグ扱いになり、タップが飲み込まれてしまう。それを防ぐため、
+  // ドラッグの開始位置と直近の位置を覚えておき、離した時の移動量が小さいうちは
+  // タップとして処理し直す(ScaleEnd 側の救済。カール・つながり共用)
+  static const double _tapSlop = 24; // これ以内の移動ならタップとして扱う(通常のタップ判定18pxより少し甘め)
+  Offset _tapStartFocal = Offset.zero; // ドラッグ開始時の指の位置
+  Offset _tapLastFocal = Offset.zero; // 直近の指の位置(タップ位置の判定にも使う)
+  bool _tapCand = false; // このドラッグが「ブレたタップ」の候補かどうか
+  bool _uiAtDragStart = false; // ドラッグ開始時点のメニュー表示状態(開始時に一旦消えるので、タップ判定用に覚える)
   ui.Image? _hi; // 拡大用の高解像度画像
   bool _hiLoading = false;
 
@@ -1197,7 +1205,6 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
 
   @override
   void dispose() {
-    _uiTimer?.cancel();
     _hi?.dispose();
     _ac.dispose();
     _stripModel.dispose();
@@ -1795,8 +1802,10 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
       pos + (_rtl ? (_viewSize.width - sx) : sx) / z;
 
   void _onStripScaleStart(ScaleStartDetails d) {
+    _uiAtDragStart = _ui; // タップ判定用に、消す前の表示状態を覚える
+    _tapStartFocal = d.localFocalPoint;
+    _tapLastFocal = d.localFocalPoint;
     _sDragging = true; // 流している間は読み込みと破棄を止める(_sync 参照)
-    _uiTimer?.cancel();
     if (_ui) setState(() => _ui = false); // 流し始めたらメニューを消す
     if (_stripAnim) {
       _stripAnimGen++;
@@ -1806,6 +1815,7 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
       _ac.stop();
     }
     _sPinching = d.pointerCount >= 2;
+    _tapCand = d.pointerCount == 1 && !_sPinching; // 1本指の小さい動きは「ブレたタップ」候補
     _sStartPos = _sPos;
     _sStartZoom = _sZoom;
     _sStartOffY = _sOffY;
@@ -1831,6 +1841,8 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
   }
 
   void _onStripScaleUpdate(ScaleUpdateDetails d) {
+    _tapLastFocal = d.localFocalPoint;
+    if (d.pointerCount > 1) _tapCand = false; // 2本指になったらタップ候補ではない
     if (!_sPinching && d.pointerCount >= 2) _regrabStrip(d);
     if (_sPinching) {
       // ピンチ: 指の下にある帯の点が指に付いてくるように、拡大と位置を決める
@@ -1868,6 +1880,8 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
   }
 
   void _onStripScaleEnd(ScaleEndDetails d) {
+    final tapCand = _tapCand;
+    _tapCand = false;
     _sDragging = false; // ドラッグは終わり。勢いの滑りが始まる場合は、止まるまで読み込みと破棄を止め続ける(_sGliding)
     if (_sPinching) {
       _sPinching = false;
@@ -1895,16 +1909,25 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
       _syncStripIndex();
       _pushStripView(); // 止まったので、描画の画質フィルタを元に戻す
       _syncNow(); // 止まったので、先読みと破棄を合わせ直す
+      // ブレたタップの救済: ドラッグ扱いになっても、移動が小さく勢いも付いていなければ
+      // タップとして処理する(拡大中のパン操作は対象外)
+      if (tapCand &&
+          _sZoom <= 1.001 &&
+          (_tapLastFocal - _tapStartFocal).distance <= _tapSlop) {
+        _ui = _uiAtDragStart; // 開始時に一旦消した表示状態を戻し、タップ側の判定に任せる
+        _stripTapAt(_tapLastFocal, _viewSize);
+      }
       return;
     }
     _stripGlide(v0);
   }
 
-  void _onStripTapUp(TapUpDetails d, Size size) {
+  /// つながり側のタップ処理(タップ位置で判定する。通常のタップと、ブレたタップの救済で共用)
+  void _stripTapAt(Offset pos, Size size) {
     final now = DateTime.now();
     final isDouble = now.difference(_lastTap).inMilliseconds < 300;
     _lastTap = now;
-    final x = d.localPosition.dx / size.width;
+    final x = pos.dx / size.width;
     final center = x >= 0.3 && x <= 0.7;
     if (_sZoom > 1.001) {
       if (isDouble) {
@@ -1921,7 +1944,6 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
       return;
     }
     if (center) {
-      _uiTimer?.cancel();
       setState(() => _ui = !_ui);
       return;
     }
@@ -1989,22 +2011,17 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
     WidgetsBinding.instance.addPostFrameCallback((_) => old?.dispose());
   }
 
-  void _zoomAt(Offset p) {
-    setState(() {
-      _zoom = _doubleTapZoom;
-      _offset = _clampOffset(p - p * _doubleTapZoom, _doubleTapZoom);
-    });
-    _ensureHi();
-  }
-
   /* ---- 1本指=めくり / 2本指=ズーム / 拡大中の1本指=移動 ---- */
   void _onScaleStart(ScaleStartDetails d) {
-    _uiTimer?.cancel();
+    _uiAtDragStart = _ui; // タップ判定用に、消す前の表示状態を覚える
+    _tapStartFocal = d.localFocalPoint;
+    _tapLastFocal = d.localFocalPoint;
     if (_ui) setState(() => _ui = false); // めくり・拡大を始めたらメニューを消す
     _startZoom = _zoom;
     _startOffset = _offset;
     _startFocal = d.localFocalPoint;
     _pinching = (d.pointerCount >= 2 || _zoom > 1.001) && _mode == 0 && !_ac.isAnimating;
+    _tapCand = d.pointerCount == 1 && !_pinching; // 1本指の小さい動きは「ブレたタップ」候補
     if (!_pinching && !_ac.isAnimating && _mode == 0) {
       _tilt = _tiltFromY(d.localFocalPoint.dy); // つまんだ高さで折り目が傾く
     }
@@ -2012,6 +2029,8 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
 
   void _onScaleUpdate(ScaleUpdateDetails d) {
     if (_ac.isAnimating) return;
+    _tapLastFocal = d.localFocalPoint;
+    if (d.pointerCount > 1) _tapCand = false; // 2本指になったらタップ候補ではない
 
     if (_pinching) {
       final z = (_startZoom * d.scale).clamp(1.0, _maxZoom).toDouble();
@@ -2043,6 +2062,8 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
   }
 
   void _onScaleEnd(ScaleEndDetails d) {
+    final tapCand = _tapCand;
+    _tapCand = false;
     if (_pinching) {
       _pinching = false;
       if (_zoom < 1.05) _resetZoom(); // ほぼ等倍なら元に戻す
@@ -2050,6 +2071,12 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
     }
     if (_mode == 0) {
       _acc = 0;
+      // ブレたタップの救済: ドラッグ扱いになっても、めくりが始まっておらず
+      // 移動が小さいうちはタップとして処理する
+      if (tapCand && (_tapLastFocal - _tapStartFocal).distance <= _tapSlop) {
+        _ui = _uiAtDragStart; // 開始時に一旦消した表示状態を戻し、タップ側の判定に任せる
+        _curlTapAt(_tapLastFocal, _viewSize);
+      }
       return;
     }
     final v = d.velocity.pixelsPerSecond.dx * _sgn; // 正:次へ方向(px/秒)
@@ -2059,6 +2086,30 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
     } else {
       _settle((_progress < 1 - _commitAt || v < -_flickSpeed) ? 0 : 1, pv);
     }
+  }
+
+  /// カール側のタップ処理(タップ位置で判定する。通常のタップと、ブレたタップの救済で共用)
+  void _curlTapAt(Offset pos, Size size) {
+    final now = DateTime.now();
+    final isDouble = now.difference(_lastTap).inMilliseconds < 300;
+    _lastTap = now;
+    final x = pos.dx / size.width;
+    final center = x >= 0.3 && x <= 0.7;
+    if (_zoom > 1.001) {
+      if (isDouble) {
+        _resetZoom(); // 拡大中のダブルタップで等倍に戻る
+      }
+      return;
+    }
+    if (center) {
+      // 中央タップは即メニュー表示(ダブルタップ拡大は廃止。拡大はピンチのみ)
+      setState(() => _ui = !_ui);
+      return;
+    }
+    _tilt = _tiltFromY(pos.dy);
+    if (_ui) setState(() => _ui = false); // 端をタップしてめくるときもメニューを消す
+    if (x < 0.3) _flip(_rtl ? 1 : -1);
+    if (x > 0.7) _flip(_rtl ? -1 : 1);
   }
 
   /* ---- メニュー(上のバー) ---- */
@@ -2223,7 +2274,7 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
                 onScaleStart: _onStripScaleStart,
                 onScaleUpdate: _onStripScaleUpdate,
                 onScaleEnd: _onStripScaleEnd,
-                onTapUp: (d) => _onStripTapUp(d, size),
+                onTapUp: (d) => _stripTapAt(d.localPosition, size),
                 child: slots.isNotEmpty
                     // 帯だけを描き直し範囲として隔離する(上下のバー等を同じ絵に巻き込まない)
                     ? RepaintBoundary(child: CustomPaint(painter: _StripPainter(_stripModel, slots)))
@@ -2242,36 +2293,7 @@ class _ReaderState extends State<Reader> with SingleTickerProviderStateMixin {
               onScaleStart: _onScaleStart,
               onScaleUpdate: _onScaleUpdate,
               onScaleEnd: _onScaleEnd,
-              onTapUp: (d) {
-                final now = DateTime.now();
-                final isDouble = now.difference(_lastTap).inMilliseconds < 300;
-                _lastTap = now;
-                final x = d.localPosition.dx / size.width;
-                final center = x >= 0.3 && x <= 0.7;
-                if (_zoom > 1.001) {
-                  if (isDouble) {
-                    _uiTimer?.cancel();
-                    _resetZoom(); // 拡大中のダブルタップで等倍に戻る
-                  }
-                  return;
-                }
-                if (center) {
-                  _uiTimer?.cancel();
-                  if (isDouble) {
-                    _zoomAt(d.localPosition); // 中央のダブルタップで拡大
-                  } else {
-                    // 1回タップ: ダブルタップでないと分かってからメニューを出す
-                    _uiTimer = Timer(const Duration(milliseconds: 300), () {
-                      if (mounted) setState(() => _ui = !_ui);
-                    });
-                  }
-                  return;
-                }
-                _tilt = _tiltFromY(d.localPosition.dy);
-                if (_ui) setState(() => _ui = false); // 端をタップしてめくるときもメニューを消す
-                if (x < 0.3) _flip(_rtl ? 1 : -1);
-                if (x > 0.7) _flip(_rtl ? -1 : 1);
-              },
+              onTapUp: (d) => _curlTapAt(d.localPosition, size),
               child: ready
                   ? CustomPaint(
                       painter: (_zoom > 1.001 && _mode == 0)
