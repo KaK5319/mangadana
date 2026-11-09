@@ -427,6 +427,14 @@ class _ShelfState extends State<Shelf> with TickerProviderStateMixin {
               _importFile();
             },
           ),
+          ListTile(
+            leading: const Icon(Icons.library_add),
+            title: const Text('まとめて追加（複数のファイル）'),
+            onTap: () {
+              Navigator.pop(c);
+              _importFilesBulk();
+            },
+          ),
         ]),
       ),
     );
@@ -447,6 +455,40 @@ class _ShelfState extends State<Shelf> with TickerProviderStateMixin {
     if (mounted) setState(() => _busy = false);
   }
 
+  /// 1ファイルを1冊分の本に変換する(呼び出し側で検証済みのファイル用)。
+  /// 形式の判断は拡張子ではなく中身(マジックバイト)で行う。失敗したらフォルダごと消して投げ直す
+  Future<Book> _convertFile(
+      PlatformFile f, String title, String ext, void Function(String) onStatus) async {
+    final path = f.path!;
+    final (id, dir) = await Store.newBookDir();
+    try {
+      // 拡張子ではなく、中身で形式を判断する(.cbr でも実はzipということが多い)
+      var kind = await sniffKind(path);
+      if (kind == 'unknown') kind = (ext == 'pdf') ? 'pdf' : ((ext == 'rar' || ext == 'cbr') ? 'rar' : 'zip');
+
+      final List<String> paths;
+      if (kind == 'pdf') {
+        paths = await Store.importPdf(path, dir, (i, n) => onStatus('変換中 $i / $n ページ'));
+      } else if (kind == 'rar') {
+        onStatus('RARを展開中…(少し時間がかかります)');
+        final tmp = Directory('${dir.path}/_rar');
+        await tmp.create(recursive: true);
+        final r = await Rar.extractRarFile(rarFilePath: path, destinationPath: tmp.path);
+        if (r['success'] != true) throw (r['message'] ?? 'RARを展開できませんでした');
+        paths = await compute(collectImages, [tmp.path, dir.path]);
+        if (await tmp.exists()) await tmp.delete(recursive: true);
+      } else {
+        onStatus('展開中…(少し時間がかかります)');
+        paths = await compute(extractZip, [path, dir.path]);
+      }
+      if (paths.isEmpty) throw '画像が見つかりませんでした';
+      return Book(id, title, paths)..shelfId = widget.info.id;
+    } catch (_) {
+      if (await dir.exists()) await dir.delete(recursive: true);
+      rethrow;
+    }
+  }
+
   Future<void> _importFile() async {
     final res = await FilePicker.platform.pickFiles(type: FileType.any);
     if (res == null || res.files.isEmpty) return;
@@ -464,38 +506,76 @@ class _ShelfState extends State<Shelf> with TickerProviderStateMixin {
       _busy = true;
       _busyText = '読み込み中…';
     });
-    final (id, dir) = await Store.newBookDir();
     try {
-      // 拡張子ではなく、中身で形式を判断する(.cbr でも実はzipということが多い)
-      var kind = await sniffKind(path);
-      if (kind == 'unknown') kind = (ext == 'pdf') ? 'pdf' : ((ext == 'rar' || ext == 'cbr') ? 'rar' : 'zip');
-
-      final List<String> paths;
-      if (kind == 'pdf') {
-        paths = await Store.importPdf(path, dir, (i, n) {
-          if (mounted) setState(() => _busyText = '変換中 $i / $n ページ');
-        });
-      } else if (kind == 'rar') {
-        if (mounted) setState(() => _busyText = 'RARを展開中…(少し時間がかかります)');
-        final tmp = Directory('${dir.path}/_rar');
-        await tmp.create(recursive: true);
-        final r = await Rar.extractRarFile(rarFilePath: path, destinationPath: tmp.path);
-        if (r['success'] != true) throw (r['message'] ?? 'RARを展開できませんでした');
-        paths = await compute(collectImages, [tmp.path, dir.path]);
-        if (await tmp.exists()) await tmp.delete(recursive: true);
-      } else {
-        if (mounted) setState(() => _busyText = '展開中…(少し時間がかかります)');
-        paths = await compute(extractZip, [path, dir.path]);
-      }
-      if (paths.isEmpty) throw '画像が見つかりませんでした';
-      AppData.I.books.add(Book(id, title, paths)..shelfId = widget.info.id);
+      final book = await _convertFile(f, title, ext, (s) {
+        if (mounted) setState(() => _busyText = s);
+      });
+      AppData.I.books.add(book);
       await AppData.I.save();
     } catch (e) {
-      if (await dir.exists()) await dir.delete(recursive: true);
       _snack('読み込めませんでした: $e');
     } finally {
       if (mounted) setState(() => _busy = false);
     }
+  }
+
+  /// 複数ファイルを一度に選び、ファイル名の自然順に1冊ずつ取り込む(映画棚の「まとめて追加」と同じ形)。
+  /// 対応外・破損のファイルは飛ばして続け、最後に結果をまとめて見せる
+  Future<void> _importFilesBulk() async {
+    final res = await FilePicker.platform.pickFiles(type: FileType.any, allowMultiple: true);
+    if (res == null || res.files.isEmpty) return;
+    final files = List<PlatformFile>.of(res.files)
+      ..sort((a, b) => natCompare(a.name, b.name)); // ファイル名の自然順(2巻の次に10巻)
+
+    setState(() {
+      _busy = true;
+      _busyText = '読み込み中…';
+    });
+    var added = 0;
+    final failed = <String>[];
+    try {
+      for (var i = 0; i < files.length; i++) {
+        final f = files[i];
+        final dot = f.name.lastIndexOf('.');
+        final ext = dot < 0 ? '' : f.name.substring(dot + 1).toLowerCase();
+        final title = dot < 0 ? f.name : f.name.substring(0, dot);
+        if (mounted) {
+          setState(() => _busyText = 'まとめて追加中 ${i + 1} / ${files.length} 冊目\n「$title」');
+        }
+        if (f.path == null || !['pdf', 'cbz', 'zip', 'rar', 'cbr'].contains(ext)) {
+          failed.add(f.name); // 対応外は飛ばして次へ
+          continue;
+        }
+        try {
+          final book = await _convertFile(f, title, ext, (s) {
+            if (mounted) {
+              setState(() => _busyText = 'まとめて追加中 ${i + 1} / ${files.length} 冊目\n「$title」\n$s');
+            }
+          });
+          AppData.I.books.add(book);
+          await AppData.I.save(); // 1冊ごとに保存する(途中で離れても、入った分は残る)
+          added++;
+        } catch (_) {
+          failed.add(f.name); // 壊れているファイルは飛ばして次へ
+        }
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+    if (!mounted) return;
+    final failText = failed.isEmpty ? '' : '\n\n読み込めなかったファイル:\n${failed.map((n) => '・$n').join('\n')}';
+    await showDialog<void>(
+      context: context,
+      builder: (c) => AlertDialog(
+        title: const Text('まとめて追加の結果'),
+        content: SingleChildScrollView(
+          child: Text(added > 0 ? '$added 冊を追加しました$failText' : '追加できた本はありませんでした$failText'),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(c), child: const Text('閉じる')),
+        ],
+      ),
+    );
   }
 
   void _showBookMenu(Book b) {
