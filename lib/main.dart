@@ -3079,63 +3079,67 @@ class _HomePageState extends State<HomePage> {
                 return Padding(
                   key: ValueKey(s.id),
                   padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                  child: Material(
-                    color: cardWhite,
-                    elevation: 2,
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(14),
-                      side: const BorderSide(color: cardBorder),
-                    ),
-                    child: InkWell(
-                      borderRadius: BorderRadius.circular(14),
-                      onTap: () => Navigator.push(
-                        context,
-                        MaterialPageRoute(builder: (_) => Shelf(info: s)),
-                      ).then((_) => setState(() {})),
-                      child: Padding(
-                        padding: const EdgeInsets.all(12),
-                        child: Row(children: [
-                          // 先頭の本の表紙(なければ、棚のアイコン)
-                          SizedBox(
-                            width: 52,
-                            height: 74,
-                            child: books.isEmpty
-                                ? const DecoratedBox(
-                                    decoration: BoxDecoration(color: pageCream),
-                                    child: Icon(Icons.menu_book, color: wood),
-                                  )
-                                : Image.file(File(books.first.pages.first), fit: BoxFit.cover, cacheWidth: 200),
-                          ),
-                          const SizedBox(width: 14),
-                          Expanded(
-                            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                              Text(s.name,
-                                  maxLines: 2,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: const TextStyle(fontSize: 19, fontWeight: FontWeight.w700, color: ink)),
-                              const SizedBox(height: 4),
-                              Text('${books.length}冊', style: const TextStyle(color: wood, fontSize: 14)),
-                            ]),
-                          ),
-                          PopupMenuButton<String>(
-                            icon: const Icon(Icons.more_vert, color: wood),
-                            onSelected: (v) {
-                              if (v == 'rename') _renameShelf(s);
-                              if (v == 'delete') _deleteShelf(s);
-                            },
-                            itemBuilder: (c) => const [
-                              PopupMenuItem(value: 'rename', child: Text('名前を変更')),
-                              PopupMenuItem(value: 'delete', child: Text('削除')),
-                            ],
-                          ),
-                          ReorderableDragStartListener(
-                            index: i,
-                            child: const Padding(
-                              padding: EdgeInsets.all(8),
-                              child: Icon(Icons.drag_handle, color: wood),
+                  // カード本体の長押しでも並び替え開始(≡ハンドルからのドラッグと両立)
+                  child: ReorderableDelayedDragStartListener(
+                    index: i,
+                    child: Material(
+                      color: cardWhite,
+                      elevation: 2,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14),
+                        side: const BorderSide(color: cardBorder),
+                      ),
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(14),
+                        onTap: () => Navigator.push(
+                          context,
+                          MaterialPageRoute(builder: (_) => Shelf(info: s)),
+                        ).then((_) => setState(() {})),
+                        child: Padding(
+                          padding: const EdgeInsets.all(12),
+                          child: Row(children: [
+                            // 先頭の本の表紙(なければ、棚のアイコン)
+                            SizedBox(
+                              width: 52,
+                              height: 74,
+                              child: books.isEmpty
+                                  ? const DecoratedBox(
+                                      decoration: BoxDecoration(color: pageCream),
+                                      child: Icon(Icons.menu_book, color: wood),
+                                    )
+                                  : Image.file(File(books.first.pages.first), fit: BoxFit.cover, cacheWidth: 200),
                             ),
-                          ),
-                        ]),
+                            const SizedBox(width: 14),
+                            Expanded(
+                              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                                Text(s.name,
+                                    maxLines: 2,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(fontSize: 19, fontWeight: FontWeight.w700, color: ink)),
+                                const SizedBox(height: 4),
+                                Text('${books.length}冊', style: const TextStyle(color: wood, fontSize: 14)),
+                              ]),
+                            ),
+                            PopupMenuButton<String>(
+                              icon: const Icon(Icons.more_vert, color: wood),
+                              onSelected: (v) {
+                                if (v == 'rename') _renameShelf(s);
+                                if (v == 'delete') _deleteShelf(s);
+                              },
+                              itemBuilder: (c) => const [
+                                PopupMenuItem(value: 'rename', child: Text('名前を変更')),
+                                PopupMenuItem(value: 'delete', child: Text('削除')),
+                              ],
+                            ),
+                            ReorderableDragStartListener(
+                              index: i,
+                              child: const Padding(
+                                padding: EdgeInsets.all(8),
+                                child: Icon(Icons.drag_handle, color: wood),
+                              ),
+                            ),
+                          ]),
+                        ),
                       ),
                     ),
                   ),
