@@ -402,6 +402,13 @@ class _ShelfState extends State<Shelf> with TickerProviderStateMixin {
   bool _busy = false;
   String _busyText = '';
 
+  // ファイルを選んでから受け取りが終わるまでの待ち表示。ドライブ上のファイルを
+  // 選ぶと、ピッカーが戻ってくる前にダウンロードが走る。その間も表示を出して
+  // おかないと、固まったように見えて「できているか不安」になるため、選ぶ操作の
+  // 開始時点から出しておき、変換フェーズの進捗表示にそのまま引き継ぐ
+  static const String _receivingText =
+      'ファイルを受け取り中です\nしばらくお待ちください\n（ドライブからのダウンロードには時間がかかることがあります）';
+
   // 本棚: 2本指で広げる/つまむと、写真のように拡大縮小し、離すと1段の冊数が決まる ----------
   static const bool _spreadMakesMore = false; // false: 広げると大きくなる(写真と同じ) / true: 広げると増える
   static const int _minCols = 1, _maxCols = 5;
@@ -487,8 +494,20 @@ class _ShelfState extends State<Shelf> with TickerProviderStateMixin {
   }
 
   Future<void> _importImages() async {
-    final files = await ImagePicker().pickMultiImage();
-    if (files.isEmpty) return;
+    setState(() {
+      _busy = true;
+      _busyText = _receivingText;
+    });
+    List<XFile> files;
+    try {
+      files = await ImagePicker().pickMultiImage();
+    } catch (_) {
+      files = []; // 選ぶのに失敗したら、キャンセルと同じ扱いで表示だけ消す
+    }
+    if (files.isEmpty) {
+      if (mounted) setState(() => _busy = false);
+      return;
+    }
     files.sort((a, b) => natCompare(a.name, b.name));
     setState(() {
       _busy = true;
@@ -549,15 +568,31 @@ class _ShelfState extends State<Shelf> with TickerProviderStateMixin {
   }
 
   Future<void> _importFile() async {
-    final res = await FilePicker.platform.pickFiles(type: FileType.any);
-    if (res == null || res.files.isEmpty) return;
+    setState(() {
+      _busy = true;
+      _busyText = _receivingText;
+    });
+    FilePickerResult? res;
+    try {
+      res = await FilePicker.platform.pickFiles(type: FileType.any);
+    } catch (_) {
+      res = null; // 選ぶのに失敗したら、キャンセルと同じ扱いで表示だけ消す
+    }
+    if (res == null || res.files.isEmpty) {
+      if (mounted) setState(() => _busy = false);
+      return;
+    }
     final f = res.files.first;
     final path = f.path;
-    if (path == null) return _snack('ファイルを読み込めませんでした');
+    if (path == null) {
+      if (mounted) setState(() => _busy = false);
+      return _snack('ファイルを読み込めませんでした');
+    }
     final dot = f.name.lastIndexOf('.');
     final ext = dot < 0 ? '' : f.name.substring(dot + 1).toLowerCase();
     final title = dot < 0 ? f.name : f.name.substring(0, dot);
     if (!['pdf', 'cbz', 'zip', 'rar', 'cbr'].contains(ext)) {
+      if (mounted) setState(() => _busy = false);
       return _snack('PDF・zip・cbz・rar・cbr のファイルを選んでください');
     }
 
@@ -581,8 +616,20 @@ class _ShelfState extends State<Shelf> with TickerProviderStateMixin {
   /// 複数ファイルを一度に選び、ファイル名の自然順に1冊ずつ取り込む(映画棚の「まとめて追加」と同じ形)。
   /// 対応外・破損のファイルは飛ばして続け、最後に結果をまとめて見せる
   Future<void> _importFilesBulk() async {
-    final res = await FilePicker.platform.pickFiles(type: FileType.any, allowMultiple: true);
-    if (res == null || res.files.isEmpty) return;
+    setState(() {
+      _busy = true;
+      _busyText = _receivingText;
+    });
+    FilePickerResult? res;
+    try {
+      res = await FilePicker.platform.pickFiles(type: FileType.any, allowMultiple: true);
+    } catch (_) {
+      res = null; // 選ぶのに失敗したら、キャンセルと同じ扱いで表示だけ消す
+    }
+    if (res == null || res.files.isEmpty) {
+      if (mounted) setState(() => _busy = false);
+      return;
+    }
     final files = List<PlatformFile>.of(res.files)
       ..sort((a, b) => natCompare(a.name, b.name)); // ファイル名の自然順(2巻の次に10巻)
 
