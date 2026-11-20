@@ -2912,6 +2912,8 @@ class _HomePageState extends State<HomePage> {
   static const woodBar = Color(0xFF8D5A33); // 上のバー: 映画棚のAppBarと同じ木の茶色
   static const wood = Color(0xFF7A4A21); // 追加ボタン: 映画棚のFABと同じ木の茶色
   static const ink = Color(0xFF2B211B); // クリーム地の上に直接出る濃い茶色(読み込み表示など)
+  static const cardWhite = Color(0xFFFFFBF2); // 棚カードの地: ドライブ移行と同じ温かみのある白
+  static const cardBorder = Color(0xFFE8DCC4); // 棚カードの薄い茶色の縁取り
 
   @override
   void initState() {
@@ -3031,8 +3033,12 @@ class _HomePageState extends State<HomePage> {
                   key: ValueKey(s.id),
                   padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
                   child: Material(
-                    color: const Color(0xFF6B4423),
-                    borderRadius: BorderRadius.circular(14),
+                    color: cardWhite,
+                    elevation: 2,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(14),
+                      side: const BorderSide(color: cardBorder),
+                    ),
                     child: InkWell(
                       borderRadius: BorderRadius.circular(14),
                       onTap: () => Navigator.push(
@@ -3048,8 +3054,8 @@ class _HomePageState extends State<HomePage> {
                             height: 74,
                             child: books.isEmpty
                                 ? const DecoratedBox(
-                                    decoration: BoxDecoration(color: Color(0xFF4A2D14)),
-                                    child: Icon(Icons.menu_book, color: tan),
+                                    decoration: BoxDecoration(color: pageCream),
+                                    child: Icon(Icons.menu_book, color: wood),
                                   )
                                 : Image.file(File(books.first.pages.first), fit: BoxFit.cover, cacheWidth: 200),
                           ),
@@ -3059,13 +3065,13 @@ class _HomePageState extends State<HomePage> {
                               Text(s.name,
                                   maxLines: 2,
                                   overflow: TextOverflow.ellipsis,
-                                  style: const TextStyle(fontSize: 19, fontWeight: FontWeight.w700, color: cream)),
+                                  style: const TextStyle(fontSize: 19, fontWeight: FontWeight.w700, color: ink)),
                               const SizedBox(height: 4),
-                              Text('${books.length}冊', style: const TextStyle(color: tan, fontSize: 14)),
+                              Text('${books.length}冊', style: const TextStyle(color: wood, fontSize: 14)),
                             ]),
                           ),
                           PopupMenuButton<String>(
-                            icon: const Icon(Icons.more_vert, color: cream),
+                            icon: const Icon(Icons.more_vert, color: wood),
                             onSelected: (v) {
                               if (v == 'rename') _renameShelf(s);
                               if (v == 'delete') _deleteShelf(s);
@@ -3079,7 +3085,7 @@ class _HomePageState extends State<HomePage> {
                             index: i,
                             child: const Padding(
                               padding: EdgeInsets.all(8),
-                              child: Icon(Icons.drag_handle, color: tan),
+                              child: Icon(Icons.drag_handle, color: wood),
                             ),
                           ),
                         ]),
