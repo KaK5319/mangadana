@@ -407,7 +407,7 @@ class _ShelfState extends State<Shelf> with TickerProviderStateMixin {
   // おかないと、固まったように見えて「できているか不安」になるため、選ぶ操作の
   // 開始時点から出しておき、変換フェーズの進捗表示にそのまま引き継ぐ
   static const String _receivingText =
-      'ファイルを受け取り中です\nしばらくお待ちください\n（ドライブからのダウンロードには時間がかかることがあります）';
+      'ファイルを受け取り中です\nしばらくお待ちください\n（ドライブからのダウンロードには時間がかかることがあります。1回目は倍ほどかかることもあります）';
 
   // 本棚: 2本指で広げる/つまむと、写真のように拡大縮小し、離すと1段の冊数が決まる ----------
   static const bool _spreadMakesMore = false; // false: 広げると大きくなる(写真と同じ) / true: 広げると増える
