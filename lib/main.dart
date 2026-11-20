@@ -3121,6 +3121,8 @@ class _HomePageState extends State<HomePage> {
                               ]),
                             ),
                             PopupMenuButton<String>(
+                              // 長押し時の説明ラベルが英語(Show menu)になるので日本語で指定する
+                              tooltip: 'メニューを表示',
                               icon: const Icon(Icons.more_vert, color: wood),
                               onSelected: (v) {
                                 if (v == 'rename') _renameShelf(s);
