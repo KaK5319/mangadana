@@ -2907,6 +2907,11 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   static const cream = Color(0xFFF1D9B5);
   static const tan = Color(0xFFD9B98A);
+  // 棚一覧画面だけの色(映画棚と共通の色使い)。全体テーマや他の画面には効かせない
+  static const pageCream = Color(0xFFF7EFE3); // 地色: 映画棚と同じ明るいクリーム
+  static const woodBar = Color(0xFF8D5A33); // 上のバー: 映画棚のAppBarと同じ木の茶色
+  static const wood = Color(0xFF7A4A21); // 追加ボタン: 映画棚のFABと同じ木の茶色
+  static const ink = Color(0xFF2B211B); // クリーム地の上に直接出る濃い茶色(読み込み表示など)
 
   @override
   void initState() {
@@ -2998,14 +3003,15 @@ class _HomePageState extends State<HomePage> {
   Widget build(BuildContext context) {
     final data = AppData.I;
     return Scaffold(
-      backgroundColor: const Color(0xFF2A1809),
+      // 地は映画棚と同じ明るいクリーム(この画面だけ。他の画面や全体テーマは変えない)
+      backgroundColor: pageCream,
       appBar: AppBar(
-        backgroundColor: const Color(0xFF1C0F05),
+        backgroundColor: woodBar,
         title: const Text('漫画棚',
             style: TextStyle(fontWeight: FontWeight.w800, letterSpacing: 1.5, color: cream)),
       ),
       body: !data.loaded
-          ? const Center(child: CircularProgressIndicator())
+          ? const Center(child: CircularProgressIndicator(color: ink))
           : ReorderableListView.builder(
               padding: const EdgeInsets.fromLTRB(0, 10, 0, 110),
               buildDefaultDragHandles: false,
@@ -3084,6 +3090,9 @@ class _HomePageState extends State<HomePage> {
               },
             ),
       floatingActionButton: FloatingActionButton.extended(
+        // この画面のボタンだけ映画棚と同じ木の茶色にする(全体テーマ経由ではないので他の画面のボタンには効かない)
+        backgroundColor: wood,
+        foregroundColor: Colors.white,
         onPressed: _addShelf,
         icon: const Icon(Icons.add),
         label: const Text('本棚を追加'),
