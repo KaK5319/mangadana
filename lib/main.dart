@@ -26,7 +26,43 @@ class SideBooksApp extends StatelessWidget {
   Widget build(BuildContext context) => MaterialApp(
         title: '漫画棚',
         debugShowCheckedModeBanner: false,
-        theme: ThemeData.dark(useMaterial3: true),
+        // 土台は暗いテーマのまま(棚の中・リーダーの画面本体は変えない)。
+        // 飛び出す画面(ダイアログ・メニュー・シート)だけ、部品ごとのテーマで
+        // 棚一覧の色使い(白 #FFFBF2・濃い文字 #2B211B・木の茶色 #7A4A21)に揃える
+        theme: ThemeData.dark(useMaterial3: true).copyWith(
+          dialogTheme: const DialogThemeData(
+            backgroundColor: Color(0xFFFFFBF2),
+            titleTextStyle: TextStyle(fontSize: 24, color: Color(0xFF2B211B)),
+            contentTextStyle: TextStyle(fontSize: 14, color: Color(0xFF2B211B)),
+          ),
+          popupMenuTheme: const PopupMenuThemeData(
+            color: Color(0xFFFFFBF2),
+            textStyle: TextStyle(fontSize: 14, fontWeight: FontWeight.w500, color: Color(0xFF2B211B)),
+          ),
+          bottomSheetTheme: const BottomSheetThemeData(
+            backgroundColor: Color(0xFFFFFBF2),
+            modalBackgroundColor: Color(0xFFFFFBF2),
+          ),
+          // ListTile はボトムシートの中でしか使っていないので、これはシート専用の色として効く
+          listTileTheme: const ListTileThemeData(
+            iconColor: Color(0xFF7A4A21),
+            textColor: Color(0xFF2B211B),
+          ),
+          textButtonTheme: TextButtonThemeData(
+            style: TextButton.styleFrom(foregroundColor: const Color(0xFF7A4A21)),
+          ),
+          // 入力欄は名前変更ダイアログの中の1か所だけ。明るい地の上で読める色にする
+          inputDecorationTheme: const InputDecorationThemeData(
+            hintStyle: TextStyle(color: Color(0x992B211B)),
+            enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Color(0xFFB9A888))),
+            focusedBorder: UnderlineInputBorder(borderSide: BorderSide(color: Color(0xFF7A4A21))),
+          ),
+          textSelectionTheme: const TextSelectionThemeData(
+            cursorColor: Color(0xFF7A4A21),
+            selectionColor: Color(0x337A4A21),
+            selectionHandleColor: Color(0xFF7A4A21),
+          ),
+        ),
         home: const HomePage(),
       );
 }
@@ -2899,6 +2935,8 @@ class _RenameDialogState extends State<_RenameDialog> {
       content: TextField(
         controller: _ctrl,
         autofocus: true,
+        // ダイアログの明るい地の上で読めるよう、入力する文字は濃い茶色で固定する
+        style: const TextStyle(color: Color(0xFF2B211B)),
         decoration: InputDecoration(hintText: widget.hint),
         onSubmitted: (v) => Navigator.pop(context, v.trim()),
       ),
