@@ -27,17 +27,14 @@ class SideBooksApp extends StatelessWidget {
         title: '漫画棚',
         debugShowCheckedModeBanner: false,
         // 土台は暗いテーマのまま(棚の中・リーダーの画面本体は変えない)。
-        // 飛び出す画面(ダイアログ・メニュー・シート)だけ、部品ごとのテーマで
-        // 棚一覧の色使い(白 #FFFBF2・濃い文字 #2B211B・木の茶色 #7A4A21)に揃える
+        // 飛び出す画面(ダイアログ・シート)だけ、部品ごとのテーマで
+        // 棚一覧の色使い(白 #FFFBF2・濃い文字 #2B211B・木の茶色 #7A4A21)に揃える。
+        // 「︙」メニューは実機確認で前の暗い表示の方が読みやすかったため、土台の既定のままにしている
         theme: ThemeData.dark(useMaterial3: true).copyWith(
           dialogTheme: const DialogThemeData(
             backgroundColor: Color(0xFFFFFBF2),
             titleTextStyle: TextStyle(fontSize: 24, color: Color(0xFF2B211B)),
             contentTextStyle: TextStyle(fontSize: 14, color: Color(0xFF2B211B)),
-          ),
-          popupMenuTheme: const PopupMenuThemeData(
-            color: Color(0xFFFFFBF2),
-            textStyle: TextStyle(fontSize: 14, fontWeight: FontWeight.w500, color: Color(0xFF2B211B)),
           ),
           bottomSheetTheme: const BottomSheetThemeData(
             backgroundColor: Color(0xFFFFFBF2),
